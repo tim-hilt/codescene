@@ -96,6 +96,7 @@ func Analyze() error {
 	}
 
 	files := make(chan FileState, runtime.NumCPU())
+	processor.ProcessConstants()
 
 	cIter.ForEach(func(c *object.Commit) error {
 		res, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
@@ -121,8 +122,6 @@ func Analyze() error {
 		}); err != nil {
 			return err
 		}
-
-		processor.ProcessConstants()
 
 		go findFiles(filesystem, commitId, c, files)
 
