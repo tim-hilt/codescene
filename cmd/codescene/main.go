@@ -1,7 +1,12 @@
 package main
 
-import "github.com/tim-hilt/codescene/internal"
+import (
+	"github.com/rs/zerolog"
+	"github.com/tim-hilt/codescene/internal"
+)
 
 func main() {
-  internal.Analyze()
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+
+	internal.Analyze()
 }

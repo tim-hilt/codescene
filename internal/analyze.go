@@ -15,6 +15,7 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage/memory"
+	"github.com/rs/zerolog/log"
 
 	// TODO: Try to get arrow support working
 	_ "github.com/marcboeker/go-duckdb/v2"
@@ -94,13 +95,13 @@ func Analyze() error {
 	if err != nil {
 		return err
 	}
-
-	files := make(chan FileState, runtime.NumCPU())
 	processor.ProcessConstants()
 
 	cIter.ForEach(func(c *object.Commit) error {
+		hash := c.Hash.String()
+		log.Info().Str("hash", hash).Msg("Processing commit")
 		res, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
-			c.Hash.String(),
+			hash,
 			c.Author.Name,
 			c.Author.When.Unix(),
 			repoUrl,
@@ -123,6 +124,8 @@ func Analyze() error {
 			return err
 		}
 
+		// PERF: We could reuse the channel, if we don't close it. We could use contexts to signal the `process` function to stop
+		files := make(chan FileState, runtime.NumCPU())
 		go findFiles(filesystem, commitId, c, files)
 
 		if err = process(filesystem, files); err != nil {
@@ -132,12 +135,12 @@ func Analyze() error {
 		return nil
 	})
 
-	close(files)
-
 	return nil
 }
 
 func findFiles(filesystem billy.Filesystem, commitId int64, commit *object.Commit, files chan FileState) error {
+	defer close(files)
+
 	err := util.Walk(filesystem, ".", func(path string, info fs.FileInfo, err error) error {
 		if info.IsDir() {
 			// Not interested in directories
@@ -259,5 +262,5 @@ func processFile(file FileState) {
 	}
 
 	// TODO: add to duckdb
-	// TODO: Could improve performance by configuring gc
+	// PERF: Could improve performance by configuring gc
 }
