@@ -2,7 +2,6 @@ package internal
 
 import (
 	"database/sql"
-	"fmt"
 	"io/fs"
 	"os"
 	"runtime"
@@ -202,9 +201,8 @@ func newFileJob(path string, info fs.FileInfo) *processor.FileJob {
 			Bytes:             info.Size(),
 			Content:           make([]byte, info.Size()),
 		}
-	} else {
-		fmt.Printf("skipping file unknown extension: %s\n", path)
 	}
+
 	return nil
 }
 
@@ -218,12 +216,10 @@ func process(filesystem billy.Filesystem, files chan FileState) error {
 				loc := file.Location
 				f, err := filesystem.Open(loc)
 				if err != nil {
-					fmt.Println("error opening file:", err)
 					continue
 				}
 				_, err = f.Read(file.Content)
 				if err != nil {
-					fmt.Println("error reading file:", err)
 					continue
 				}
 				processFile(file)
@@ -250,7 +246,6 @@ func processFile(file FileState) {
 
 		lang, err := processor.DetectSheBang(string(file.Content[:cutoff]))
 		if err != nil {
-			fmt.Println("error detecting shebang:", err)
 			return
 		}
 
@@ -261,7 +256,6 @@ func processFile(file FileState) {
 	processor.CountStats(file.FileJob)
 
 	if file.Binary {
-		fmt.Println("skipping file as binary:", file.Location)
 		return
 	}
 
