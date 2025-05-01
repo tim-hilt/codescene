@@ -58,6 +58,8 @@ func initDB(repo string, force bool) (*sql.DB, error) {
 		return db, nil
 	}
 
+	log.Info().Str("repository", repo).Msg("Force re-analyzing repository, deleting old data")
+
 	deleteFileStatesStmt := `
     DELETE FROM filestates
     WHERE commit_hash IN (
@@ -161,6 +163,11 @@ func Analyze(repo string, force bool) error {
 	if err != nil {
 		return err
 	}
+
+	if len(filestates) == 0 {
+		log.Info().Msg("No new commits processed")
+	}
+
 	if err := insert(db, filestates); err != nil {
 		return err
 	}
@@ -363,11 +370,12 @@ func collectFileStates(output chan FileState) ([]interface{}, error) {
 }
 
 func insert(db *sql.DB, values []interface{}) error {
-	log.Info().Msg("Inserting into database")
 	stmt := "INSERT INTO filestates (commit_hash, path, language, sloc, cloc, blank, lines_added, lines_removed, complexity, blame_authors, blame_dates) VALUES "
 
 	numCols := 11
 	numRows := len(values) / numCols
+
+	log.Info().Int("rows", numRows).Msg("Inserting into database")
 
 	for i := 0; i < numRows; i++ {
 		stmt += "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?), "
