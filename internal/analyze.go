@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -16,28 +17,18 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage/memory"
+	_ "github.com/marcboeker/go-duckdb/v2"
 	"github.com/rs/zerolog/log"
-
 	// TODO: Try to get arrow support working
-	"github.com/marcboeker/go-duckdb/v2"
 )
 
-func initDB() (*sql.DB, *duckdb.Appender, error) {
-	c, err := duckdb.NewConnector("codescene.db", nil)
+func initDB() (*sql.DB, error) {
+	db, err := sql.Open("duckdb", "codescene.db")
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	con, err := c.Connect(context.Background())
-	if err != nil {
-		return nil, nil, err
-	}
-
-	db := sql.OpenDB(c)
-	if _, err := db.Exec(`CREATE TABLE users (name VARCHAR, age INTEGER)`); err != nil {
-		return nil, nil, err
-	}
-
+	// TODO: Do I need a primary key for the filestates?
 	createTablesStmt := `
 				CREATE TABLE IF NOT EXISTS commits (
 					hash TEXT PRIMARY KEY UNIQUE,
@@ -58,30 +49,26 @@ func initDB() (*sql.DB, *duckdb.Appender, error) {
 					blame_authors TEXT[] NOT NULL,
 					blame_dates INTEGER[] NOT NULL
 				);`
+
 	_, err = db.Exec(createTablesStmt)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	a, err := duckdb.NewAppenderFromConn(con, "", "filestates")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return db, a, nil
+	return db, nil
 }
 
 type FileState struct {
-	CommitId int64
-	Commit   *object.Commit
+	Commit *object.Commit
 	*processor.FileJob
 }
 
 func Analyze() error {
-	db, appender, err := initDB()
+	db, err := initDB()
 	if err != nil {
 		return err
 	}
+	defer db.Close()
 
 	// TODO: Add "force" option to just reprocess all commits -> Might be useful in case anyone rebases
 	repoUrl := "https://github.com/go-git/go-billy" // HACK: Hardcoded for now
@@ -112,58 +99,58 @@ func Analyze() error {
 	}
 	processor.ProcessConstants()
 
-	cIter.ForEach(func(c *object.Commit) error {
-		// start := time.Now()
-		hash := c.Hash.String()
-		res, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
-			hash,
-			c.Author.Name,
-			c.Author.When.Unix(),
-			repoUrl,
-		)
+	output := make(chan FileState, runtime.NumCPU())
+	input := make(chan FileState, runtime.NumCPU())
 
-		if err != nil && strings.Contains(err.Error(), "Duplicate key") {
+	go func() {
+		cIter.ForEach(func(c *object.Commit) error {
+			log.Info().Str("hash", c.Hash.String()).Msg("Processing commit")
+			hash := c.Hash.String()
+			mu.Lock()
+			_, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
+				hash,
+				c.Author.Name,
+				c.Author.When.Unix(),
+				repoUrl,
+			)
+			mu.Unlock()
+
+			if err != nil && strings.Contains(err.Error(), "Duplicate key") {
+				return nil
+			} else if err != nil {
+				return err
+			}
+
+			if err := worktree.Checkout(&git.CheckoutOptions{
+				Hash: c.Hash,
+			}); err != nil {
+				return err
+			}
+
+			ctx, cancelCtx := context.WithCancel(context.Background())
+			go findFiles(cancelCtx, filesystem, c, input)
+
+			process(ctx, filesystem, input, output)
+
+			// log.Info().Str("hash", hash).Dur("duration", time.Since(start)).Msg("Finished processing commit")
 			return nil
-		} else if err != nil {
-			return err
-		}
+		})
+		close(output)
+	}()
 
-		commitId, err := res.LastInsertId()
-		if err != nil {
-			return err
-		}
-
-		if err := worktree.Checkout(&git.CheckoutOptions{
-			Hash: c.Hash,
-		}); err != nil {
-			return err
-		}
-
-		// PERF: We could reuse the channel, if we don't close it. We could use contexts to signal the `process` function to stop
-		files := make(chan FileState, runtime.NumCPU())
-		go findFiles(filesystem, commitId, c, files)
-
-		if err = process(filesystem, appender, files); err != nil {
-			return err
-		}
-
-		// log.Info().Str("hash", hash).Dur("duration", time.Since(start)).Msg("Finished processing commit")
-		return nil
-	})
-
-	if err = appender.Flush(); err != nil {
+	filestates, err := collectFileStates(output)
+	if err != nil {
 		return err
 	}
-
-	if err = appender.Close(); err != nil {
+	if err := insert(db, filestates); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func findFiles(filesystem billy.Filesystem, commitId int64, commit *object.Commit, files chan FileState) error {
-	defer close(files)
+func findFiles(cancelCtx context.CancelFunc, filesystem billy.Filesystem, commit *object.Commit, files chan FileState) error {
+	defer cancelCtx()
 
 	err := util.Walk(filesystem, ".", func(path string, info fs.FileInfo, err error) error {
 		// start := time.Now()
@@ -180,9 +167,8 @@ func findFiles(filesystem billy.Filesystem, commitId int64, commit *object.Commi
 			return err
 		}
 		files <- FileState{
-			CommitId: commitId,
-			Commit:   commit,
-			FileJob:  f,
+			Commit:  commit,
+			FileJob: f,
 		}
 		// log.Info().Dur("duration", time.Since(start)).Str("file", path).Msg("Found file")
 		return nil
@@ -234,38 +220,41 @@ func newFileJob(path string, info fs.FileInfo) *processor.FileJob {
 	return nil
 }
 
-func process(filesystem billy.Filesystem, appender *duckdb.Appender, files chan FileState) error {
+func process(ctx context.Context, filesystem billy.Filesystem, input, output chan FileState) {
 	var wg sync.WaitGroup
 
 	for i := 0; i < runtime.NumCPU(); i++ {
 		wg.Add(1)
 		go func() {
-			for file := range files {
-				// start := time.Now()
-				loc := file.Location
-				f, err := filesystem.Open(loc)
-				if err != nil {
-					continue
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case file := <-input:
+					// start := time.Now()
+					loc := file.Location
+					f, err := filesystem.Open(loc)
+					if err != nil {
+						continue
+					}
+					_, err = f.Read(file.Content)
+					if err != nil {
+						continue
+					}
+					processFile(file, output)
+					// log.Info().Dur("duration", time.Since(start)).Str("file", loc).Msg("Processed file")
 				}
-				_, err = f.Read(file.Content)
-				if err != nil {
-					continue
-				}
-				processFile(file, appender)
-				// log.Info().Dur("duration", time.Since(start)).Str("file", loc).Msg("Processed file")
 			}
-			wg.Done()
 		}()
 	}
 
 	wg.Wait()
-
-	return nil
 }
 
 var mu sync.Mutex
 
-func processFile(file FileState, appender *duckdb.Appender) {
+func processFile(file FileState, output chan FileState) {
 	file.Language = processor.DetermineLanguage(file.Filename, file.Language, file.PossibleLanguages, file.Content)
 	if file.Language == processor.SheBang {
 
@@ -291,43 +280,7 @@ func processFile(file FileState, appender *duckdb.Appender) {
 		return
 	}
 
-	stats, err := statsToMap(file.Commit)
-	if err != nil {
-		log.Error().Err(err).Msg("Error getting stats")
-		return
-	}
-
-	linesAdded, linesDeleted := 0, 0
-	if stat, ok := stats[file.Location]; ok {
-		linesAdded = stat.Addition
-		linesDeleted = stat.Deletion
-	}
-
-	blameAuthors, blameDates, err := blameToLists(file.Commit, file.Location)
-	if err != nil {
-		log.Error().Err(err).Msg("Error getting blame")
-		return
-	}
-
-	mu.Lock()
-	err = appender.AppendRow(
-		file.Commit.Hash.String(),
-		file.Location,
-		file.Language,
-		int32(file.Code),
-		int32(file.Comment),
-		int32(file.Blank),
-		int32(linesAdded),
-		int32(linesDeleted),
-		int32(file.Complexity),
-		blameAuthors,
-		blameDates,
-	)
-	mu.Unlock()
-
-	if err != nil {
-		log.Error().Err(err).Msg("Error appending row")
-	}
+	output <- file
 	// PERF: Could improve performance by configuring gc
 	// PERF: Could improve performance by passing around more pointers instead of values, esp. for FileState
 }
@@ -346,21 +299,65 @@ func statsToMap(commit *object.Commit) (map[string]object.FileStat, error) {
 	return statsMap, nil
 }
 
-func blameToLists(commit *object.Commit, fileName string) ([]string, []int32, error) {
+func blameToLists(commit *object.Commit, fileName string) (string, string, error) {
 	blame, err := git.Blame(commit, fileName)
 	if err != nil {
-		return nil, nil, err
+		return "", "", err
 	}
 
-	authors := make([]string, len(blame.Lines))
-	dates := make([]int32, len(blame.Lines))
+	authors, dates := "[", "["
 
-	for i, line := range blame.Lines {
-		authors[i] = line.AuthorName
-		dates[i] = int32(line.Date.Unix())
+	for _, line := range blame.Lines {
+		authors += "'" + line.AuthorName + "', "
+		dates += strconv.FormatInt(line.Date.Unix(), 10) + ", "
 	}
+
+	authors = strings.TrimSuffix(authors, ", ") + "]"
+	dates = strings.TrimSuffix(dates, ", ") + "]"
 
 	return authors, dates, nil
 }
 
-// TODO: Log how long processing and analyzing commit took
+func collectFileStates(output chan FileState) ([]interface{}, error) {
+	var values []interface{}
+	for file := range output {
+		stats, err := statsToMap(file.Commit)
+		if err != nil {
+			log.Error().Err(err).Msg("Error getting stats")
+			return nil, err
+		}
+
+		linesAdded, linesDeleted := 0, 0
+		if stat, ok := stats[file.Location]; ok {
+			linesAdded = stat.Addition
+			linesDeleted = stat.Deletion
+		}
+
+		blameAuthors, blameDates, err := blameToLists(file.Commit, file.Location)
+		if err != nil {
+			log.Error().Err(err).Msg("Error getting blame")
+			return nil, err
+		}
+		values = append(values, file.Commit.Hash.String(), file.Location, file.Language, file.Code, file.Comment, file.Blank, linesAdded, linesDeleted, file.Complexity, blameAuthors, blameDates)
+	}
+	return values, nil
+}
+
+func insert(db *sql.DB, values []interface{}) error {
+	log.Info().Msg("Inserting into database")
+	stmt := "INSERT INTO filestates (commit_hash, path, language, sloc, cloc, blank, lines_added, lines_removed, complexity, blame_authors, blame_dates) VALUES "
+
+	numCols := 11
+	numRows := len(values) / numCols
+
+	for i := 0; i < numRows; i++ {
+		stmt += "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?), "
+	}
+	stmt = strings.TrimSuffix(stmt, ", ")
+
+	if _, err := db.Exec(stmt, values...); err != nil {
+		return err
+	}
+
+	return nil
+}
