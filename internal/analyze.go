@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"database/sql"
 	"io/fs"
 	"os"
@@ -18,13 +19,23 @@ import (
 	"github.com/rs/zerolog/log"
 
 	// TODO: Try to get arrow support working
-	_ "github.com/marcboeker/go-duckdb/v2"
+	"github.com/marcboeker/go-duckdb/v2"
 )
 
-func initDB() (*sql.DB, error) {
-	db, err := sql.Open("duckdb", "codescene.db")
+func initDB() (*sql.DB, *duckdb.Appender, error) {
+	c, err := duckdb.NewConnector("codescene.db", nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+
+	con, err := c.Connect(context.Background())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	db := sql.OpenDB(c)
+	if _, err := db.Exec(`CREATE TABLE users (name VARCHAR, age INTEGER)`); err != nil {
+		return nil, nil, err
 	}
 
 	createTablesStmt := `
@@ -35,7 +46,6 @@ func initDB() (*sql.DB, error) {
 					project TEXT NOT NULL
 				);
 				CREATE TABLE IF NOT EXISTS filestates (
-					id INTEGER PRIMARY KEY,
 					commit_hash TEXT NOT NULL REFERENCES commits(hash),
 					path TEXT NOT NULL,
 					language TEXT NOT NULL,
@@ -47,13 +57,18 @@ func initDB() (*sql.DB, error) {
 					complexity INTEGER NOT NULL,
 					blame_authors TEXT[] NOT NULL,
 					blame_dates INTEGER[] NOT NULL
-				);` // TODO: Add array for blame
+				);`
 	_, err = db.Exec(createTablesStmt)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return db, nil
+	a, err := duckdb.NewAppenderFromConn(con, "", "filestates")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return db, a, nil
 }
 
 type FileState struct {
@@ -63,13 +78,13 @@ type FileState struct {
 }
 
 func Analyze() error {
-	db, err := initDB()
+	db, appender, err := initDB()
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 
-	repoUrl := "https://github.com/go-git/go-billy"
+	// TODO: Add "force" option to just reprocess all commits -> Might be useful in case anyone rebases
+	repoUrl := "https://github.com/go-git/go-billy" // HACK: Hardcoded for now
 	filesystem := memfs.New()
 	r, err := git.Clone(memory.NewStorage(), filesystem, &git.CloneOptions{
 		URL: repoUrl,
@@ -98,8 +113,8 @@ func Analyze() error {
 	processor.ProcessConstants()
 
 	cIter.ForEach(func(c *object.Commit) error {
+		// start := time.Now()
 		hash := c.Hash.String()
-		log.Info().Str("hash", hash).Msg("Processing commit")
 		res, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
 			hash,
 			c.Author.Name,
@@ -128,12 +143,21 @@ func Analyze() error {
 		files := make(chan FileState, runtime.NumCPU())
 		go findFiles(filesystem, commitId, c, files)
 
-		if err = process(filesystem, files); err != nil {
+		if err = process(filesystem, appender, files); err != nil {
 			return err
 		}
 
+		// log.Info().Str("hash", hash).Dur("duration", time.Since(start)).Msg("Finished processing commit")
 		return nil
 	})
+
+	if err = appender.Flush(); err != nil {
+		return err
+	}
+
+	if err = appender.Close(); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -142,6 +166,7 @@ func findFiles(filesystem billy.Filesystem, commitId int64, commit *object.Commi
 	defer close(files)
 
 	err := util.Walk(filesystem, ".", func(path string, info fs.FileInfo, err error) error {
+		// start := time.Now()
 		if info.IsDir() {
 			// Not interested in directories
 			return nil
@@ -159,6 +184,7 @@ func findFiles(filesystem billy.Filesystem, commitId int64, commit *object.Commi
 			Commit:   commit,
 			FileJob:  f,
 		}
+		// log.Info().Dur("duration", time.Since(start)).Str("file", path).Msg("Found file")
 		return nil
 	})
 	if err != nil {
@@ -208,13 +234,14 @@ func newFileJob(path string, info fs.FileInfo) *processor.FileJob {
 	return nil
 }
 
-func process(filesystem billy.Filesystem, files chan FileState) error {
+func process(filesystem billy.Filesystem, appender *duckdb.Appender, files chan FileState) error {
 	var wg sync.WaitGroup
 
 	for i := 0; i < runtime.NumCPU(); i++ {
 		wg.Add(1)
 		go func() {
 			for file := range files {
+				// start := time.Now()
 				loc := file.Location
 				f, err := filesystem.Open(loc)
 				if err != nil {
@@ -224,7 +251,8 @@ func process(filesystem billy.Filesystem, files chan FileState) error {
 				if err != nil {
 					continue
 				}
-				processFile(file)
+				processFile(file, appender)
+				// log.Info().Dur("duration", time.Since(start)).Str("file", loc).Msg("Processed file")
 			}
 			wg.Done()
 		}()
@@ -235,7 +263,9 @@ func process(filesystem billy.Filesystem, files chan FileState) error {
 	return nil
 }
 
-func processFile(file FileState) {
+var mu sync.Mutex
+
+func processFile(file FileState, appender *duckdb.Appender) {
 	file.Language = processor.DetermineLanguage(file.Filename, file.Language, file.PossibleLanguages, file.Content)
 	if file.Language == processor.SheBang {
 
@@ -261,6 +291,76 @@ func processFile(file FileState) {
 		return
 	}
 
-	// TODO: add to duckdb
+	stats, err := statsToMap(file.Commit)
+	if err != nil {
+		log.Error().Err(err).Msg("Error getting stats")
+		return
+	}
+
+	linesAdded, linesDeleted := 0, 0
+	if stat, ok := stats[file.Location]; ok {
+		linesAdded = stat.Addition
+		linesDeleted = stat.Deletion
+	}
+
+	blameAuthors, blameDates, err := blameToLists(file.Commit, file.Location)
+	if err != nil {
+		log.Error().Err(err).Msg("Error getting blame")
+		return
+	}
+
+	mu.Lock()
+	err = appender.AppendRow(
+		file.Commit.Hash.String(),
+		file.Location,
+		file.Language,
+		int32(file.Code),
+		int32(file.Comment),
+		int32(file.Blank),
+		int32(linesAdded),
+		int32(linesDeleted),
+		int32(file.Complexity),
+		blameAuthors,
+		blameDates,
+	)
+	mu.Unlock()
+
+	if err != nil {
+		log.Error().Err(err).Msg("Error appending row")
+	}
 	// PERF: Could improve performance by configuring gc
+	// PERF: Could improve performance by passing around more pointers instead of values, esp. for FileState
 }
+
+func statsToMap(commit *object.Commit) (map[string]object.FileStat, error) {
+	stats, err := commit.Stats()
+	if err != nil {
+		return nil, err
+	}
+
+	statsMap := make(map[string]object.FileStat, len(stats))
+	for _, stat := range stats {
+		statsMap[stat.Name] = stat
+	}
+
+	return statsMap, nil
+}
+
+func blameToLists(commit *object.Commit, fileName string) ([]string, []int32, error) {
+	blame, err := git.Blame(commit, fileName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	authors := make([]string, len(blame.Lines))
+	dates := make([]int32, len(blame.Lines))
+
+	for i, line := range blame.Lines {
+		authors[i] = line.AuthorName
+		dates[i] = int32(line.Date.Unix())
+	}
+
+	return authors, dates, nil
+}
+
+// TODO: Log how long processing and analyzing commit took
