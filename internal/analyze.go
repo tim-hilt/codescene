@@ -22,7 +22,7 @@ import (
 	// TODO: Try to get arrow support working
 )
 
-func initDB() (*sql.DB, error) {
+func initDB(repo string, force bool) (*sql.DB, error) {
 	db, err := sql.Open("duckdb", "codescene.db")
 	if err != nil {
 		return nil, err
@@ -50,8 +50,29 @@ func initDB() (*sql.DB, error) {
 					blame_dates INTEGER[] NOT NULL
 				);`
 
-	_, err = db.Exec(createTablesStmt)
-	if err != nil {
+	if _, err = db.Exec(createTablesStmt); err != nil {
+		return nil, err
+	}
+
+	if !force {
+		return db, nil
+	}
+
+	deleteFileStatesStmt := `
+    DELETE FROM filestates
+    WHERE commit_hash IN (
+        SELECT hash
+        FROM commits
+        WHERE project = ?
+    );`
+	if _, err := db.Exec(deleteFileStatesStmt, repo); err != nil {
+		return nil, err
+	}
+
+	deleteCommitsStmt := `
+    DELETE FROM commits
+    WHERE project = ?;`
+	if _, err := db.Exec(deleteCommitsStmt, repo); err != nil {
 		return nil, err
 	}
 
@@ -63,18 +84,16 @@ type FileState struct {
 	*processor.FileJob
 }
 
-func Analyze() error {
-	db, err := initDB()
+func Analyze(repo string, force bool) error {
+	db, err := initDB(repo, force)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	// TODO: Add "force" option to just reprocess all commits -> Might be useful in case anyone rebases
-	repoUrl := "https://github.com/go-git/go-billy" // HACK: Hardcoded for now
 	filesystem := memfs.New()
 	r, err := git.Clone(memory.NewStorage(), filesystem, &git.CloneOptions{
-		URL: repoUrl,
+		URL: repo,
 	})
 
 	if err != nil {
@@ -111,7 +130,7 @@ func Analyze() error {
 				hash,
 				c.Author.Name,
 				c.Author.When.Unix(),
-				repoUrl,
+				repo,
 			)
 			mu.Unlock()
 
