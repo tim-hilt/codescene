@@ -1,9 +1,11 @@
 package internal
 
 import (
-	"context"
 	"database/sql"
+	"errors"
+	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"runtime"
 	"strconv"
@@ -12,90 +14,63 @@ import (
 
 	"github.com/boyter/scc/v3/processor"
 	"github.com/go-git/go-billy/v5"
+
 	"github.com/go-git/go-billy/v5/memfs"
 	"github.com/go-git/go-billy/v5/util"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage/memory"
-	_ "github.com/marcboeker/go-duckdb/v2"
 	"github.com/rs/zerolog/log"
+
 	// TODO: Try to get arrow support working
+	"github.com/tim-hilt/codescene/internal/database"
 )
-
-func initDB(repo string, force bool) (*sql.DB, error) {
-	db, err := sql.Open("duckdb", "codescene.db")
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO: Do I need a primary key for the filestates?
-	createTablesStmt := `
-				CREATE TABLE IF NOT EXISTS commits (
-					hash TEXT PRIMARY KEY UNIQUE,
-					contributor TEXT NOT NULL,
-					author_date INTEGER NOT NULL,
-					project TEXT NOT NULL
-				);
-				CREATE TABLE IF NOT EXISTS filestates (
-					commit_hash TEXT NOT NULL REFERENCES commits(hash),
-					path TEXT NOT NULL,
-					language TEXT NOT NULL,
-					sloc INTEGER NOT NULL,
-					cloc INTEGER NOT NULL,
-					blank INTEGER NOT NULL,
-					lines_added INTEGER NOT NULL,
-					lines_removed INTEGER NOT NULL,
-					complexity INTEGER NOT NULL,
-					blame_authors TEXT[] NOT NULL,
-					blame_dates INTEGER[] NOT NULL
-				);`
-
-	if _, err = db.Exec(createTablesStmt); err != nil {
-		return nil, err
-	}
-
-	if !force {
-		return db, nil
-	}
-
-	log.Info().Str("repository", repo).Msg("Force re-analyzing repository, deleting old data")
-
-	deleteFileStatesStmt := `
-    DELETE FROM filestates
-    WHERE commit_hash IN (
-        SELECT hash
-        FROM commits
-        WHERE project = ?
-    );`
-	if _, err := db.Exec(deleteFileStatesStmt, repo); err != nil {
-		return nil, err
-	}
-
-	deleteCommitsStmt := `
-    DELETE FROM commits
-    WHERE project = ?;`
-	if _, err := db.Exec(deleteCommitsStmt, repo); err != nil {
-		return nil, err
-	}
-
-	return db, nil
-}
 
 type FileState struct {
 	Commit *object.Commit
 	*processor.FileJob
 }
 
-func Analyze(repo string, force bool) error {
-	db, err := initDB(repo, force)
+func sanitizeRepo(repo string) (string, error) {
+	u, err := url.Parse(repo)
+	if err != nil {
+		return "", err
+	}
+
+	if u.Host == "" {
+		// Assume github.com, if host not provided
+		u.Host = "github.com"
+	}
+
+	u.Path = strings.TrimSuffix(strings.TrimPrefix(u.Path, "/"), "/")
+
+	if len(strings.Split(u.Path, "/")) != 2 {
+		return "", errors.New("provide repo in the format <user>/<repo>")
+	}
+
+	repo = u.Host + "/" + u.Path
+
+	return repo, nil
+}
+
+func Analyze(db *sql.DB, repo string, force bool, commitCompletedCallback func(curr, total int)) error {
+
+	repo, err := sanitizeRepo(repo)
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+
+	if force {
+		log.Info().Str("repo", repo).Msg("Force re-analyzing repository, deleting old data")
+
+		if err := database.Clean(db, repo); err != nil {
+			return err
+		}
+	}
 
 	filesystem := memfs.New()
 	r, err := git.Clone(memory.NewStorage(), filesystem, &git.CloneOptions{
-		URL: repo,
+		URL: "https://" + repo,
 	})
 
 	if err != nil {
@@ -103,14 +78,23 @@ func Analyze(repo string, force bool) error {
 	}
 
 	ref, err := r.Head()
+	if err != nil {
+		return err
+	}
+
+	cIter, err := r.Log(&git.LogOptions{
+		From: ref.Hash(),
+	})
 
 	if err != nil {
 		return err
 	}
 
-	cIter, err := r.Log(&git.LogOptions{From: ref.Hash()})
-
-	if err != nil {
+	commits := make([]*object.Commit, 0)
+	if err = cIter.ForEach(func(c *object.Commit) error {
+		commits = append(commits, c)
+		return nil
+	}); err != nil {
 		return err
 	}
 
@@ -120,14 +104,16 @@ func Analyze(repo string, force bool) error {
 	}
 	processor.ProcessConstants()
 
-	output := make(chan FileState, runtime.NumCPU())
-	input := make(chan FileState, runtime.NumCPU())
+	errs := make(chan error)
 
 	go func() {
-		cIter.ForEach(func(c *object.Commit) error {
-			log.Info().Str("hash", c.Hash.String()).Msg("Processing commit")
+		defer close(errs)
+
+		for i, c := range commits {
 			hash := c.Hash.String()
 			mu.Lock()
+			// TODO: Maybe I should do this in the cIter function above, so that I have a list of commits that I REALLY
+			// have to analyze. This would allow for better reporting in the callback.
 			_, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
 				hash,
 				c.Author.Name,
@@ -137,72 +123,58 @@ func Analyze(repo string, force bool) error {
 			mu.Unlock()
 
 			if err != nil && strings.Contains(err.Error(), "Duplicate key") {
-				return nil
+				continue
 			} else if err != nil {
-				return err
+				errs <- err
+				return
 			}
 
 			if err := worktree.Checkout(&git.CheckoutOptions{
 				Hash: c.Hash,
 			}); err != nil {
-				return err
+				errs <- err
+				return
 			}
 
-			ctx, cancelCtx := context.WithCancel(context.Background())
-			go findFiles(cancelCtx, filesystem, c, input)
+			input := make(chan FileState, runtime.NumCPU())
+			go findFiles(filesystem, c, input, errs)
 
-			process(ctx, filesystem, input, output)
-
-			// log.Info().Str("hash", hash).Dur("duration", time.Since(start)).Msg("Finished processing commit")
-			return nil
-		})
-		close(output)
+			process(db, filesystem, input, errs)
+			commitCompletedCallback(i+1, len(commits))
+		}
 	}()
 
-	filestates, err := collectFileStates(output)
-	if err != nil {
-		return err
-	}
-
-	if len(filestates) == 0 {
-		log.Info().Msg("No new commits processed")
-	}
-
-	if err := insert(db, filestates); err != nil {
+	for err := range errs {
 		return err
 	}
 
 	return nil
 }
 
-func findFiles(cancelCtx context.CancelFunc, filesystem billy.Filesystem, commit *object.Commit, files chan FileState) error {
-	defer cancelCtx()
-
+func findFiles(filesystem billy.Filesystem, commit *object.Commit, files chan FileState, errs chan error) {
 	err := util.Walk(filesystem, ".", func(path string, info fs.FileInfo, err error) error {
-		// start := time.Now()
 		if info.IsDir() {
 			// Not interested in directories
 			return nil
 		}
 		if err != nil {
-			// Also not interested in handling errors passed to the function specifically
-			return nil
+			return err
 		}
 		f := newFileJob(path, info)
 		if f == nil {
-			return err
+			return nil
 		}
 		files <- FileState{
 			Commit:  commit,
 			FileJob: f,
 		}
-		// log.Info().Dur("duration", time.Since(start)).Str("file", path).Msg("Found file")
 		return nil
 	})
 	if err != nil {
-		return err
+		errs <- err
 	}
-	return nil
+
+	close(files)
 }
 
 var LargeByteCount int64 = 1000000
@@ -246,30 +218,33 @@ func newFileJob(path string, info fs.FileInfo) *processor.FileJob {
 	return nil
 }
 
-func process(ctx context.Context, filesystem billy.Filesystem, input, output chan FileState) {
+func process(db *sql.DB, filesystem billy.Filesystem, input chan FileState, errs chan error) {
 	var wg sync.WaitGroup
+
+	stmt, err := db.Prepare("INSERT INTO filestates (commit_hash, path, language, sloc, cloc, blank, lines_added, lines_removed, complexity, blame_authors, blame_dates) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		errs <- err
+	}
 
 	for i := 0; i < runtime.NumCPU(); i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
+			for file := range input {
+				loc := file.Location
+				f, err := filesystem.Open(loc)
+				if err != nil {
+					errs <- err
 					return
-				case file := <-input:
-					// start := time.Now()
-					loc := file.Location
-					f, err := filesystem.Open(loc)
-					if err != nil {
-						continue
-					}
-					_, err = f.Read(file.Content)
-					if err != nil {
-						continue
-					}
-					processFile(file, output)
-					// log.Info().Dur("duration", time.Since(start)).Str("file", loc).Msg("Processed file")
+				}
+				_, err = f.Read(file.Content)
+				if err != nil && err != io.EOF {
+					errs <- err
+					return
+				}
+				if err = processFile(stmt, file); err != nil && err.Error() != "Missing #!" {
+					errs <- err
+					return
 				}
 			}
 		}()
@@ -280,7 +255,7 @@ func process(ctx context.Context, filesystem billy.Filesystem, input, output cha
 
 var mu sync.Mutex
 
-func processFile(file FileState, output chan FileState) {
+func processFile(stmt *sql.Stmt, file FileState) error {
 	file.Language = processor.DetermineLanguage(file.Filename, file.Language, file.PossibleLanguages, file.Content)
 	if file.Language == processor.SheBang {
 
@@ -293,7 +268,7 @@ func processFile(file FileState, output chan FileState) {
 
 		lang, err := processor.DetectSheBang(string(file.Content[:cutoff]))
 		if err != nil {
-			return
+			return err
 		}
 
 		file.Language = lang
@@ -303,12 +278,30 @@ func processFile(file FileState, output chan FileState) {
 	processor.CountStats(file.FileJob)
 
 	if file.Binary {
-		return
+		// Stop analysis, but not an error
+		return nil
 	}
 
-	output <- file
+	stats, err := statsToMap(file.Commit)
+	if err != nil {
+		return err
+	}
+
+	linesAdded, linesDeleted := 0, 0
+	if stat, ok := stats[file.Location]; ok {
+		linesAdded = stat.Addition
+		linesDeleted = stat.Deletion
+	}
+
+	blameAuthors, blameDates, err := blameToLists(file.Commit, file.Location)
+	if err != nil {
+		return err
+	}
+
+	stmt.Exec(file.Commit.Hash.String(), file.Location, file.Language, file.Code, file.Comment, file.Blank, linesAdded, linesDeleted, file.Complexity, blameAuthors, blameDates)
 	// PERF: Could improve performance by configuring gc
 	// PERF: Could improve performance by passing around more pointers instead of values, esp. for FileState
+	return nil
 }
 
 func statsToMap(commit *object.Commit) (map[string]object.FileStat, error) {
@@ -342,49 +335,4 @@ func blameToLists(commit *object.Commit, fileName string) (string, string, error
 	dates = strings.TrimSuffix(dates, ", ") + "]"
 
 	return authors, dates, nil
-}
-
-func collectFileStates(output chan FileState) ([]interface{}, error) {
-	var values []interface{}
-	for file := range output {
-		stats, err := statsToMap(file.Commit)
-		if err != nil {
-			log.Error().Err(err).Msg("Error getting stats")
-			return nil, err
-		}
-
-		linesAdded, linesDeleted := 0, 0
-		if stat, ok := stats[file.Location]; ok {
-			linesAdded = stat.Addition
-			linesDeleted = stat.Deletion
-		}
-
-		blameAuthors, blameDates, err := blameToLists(file.Commit, file.Location)
-		if err != nil {
-			log.Error().Err(err).Msg("Error getting blame")
-			return nil, err
-		}
-		values = append(values, file.Commit.Hash.String(), file.Location, file.Language, file.Code, file.Comment, file.Blank, linesAdded, linesDeleted, file.Complexity, blameAuthors, blameDates)
-	}
-	return values, nil
-}
-
-func insert(db *sql.DB, values []interface{}) error {
-	stmt := "INSERT INTO filestates (commit_hash, path, language, sloc, cloc, blank, lines_added, lines_removed, complexity, blame_authors, blame_dates) VALUES "
-
-	numCols := 11
-	numRows := len(values) / numCols
-
-	log.Info().Int("rows", numRows).Msg("Inserting into database")
-
-	for i := 0; i < numRows; i++ {
-		stmt += "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?), "
-	}
-	stmt = strings.TrimSuffix(stmt, ", ")
-
-	if _, err := db.Exec(stmt, values...); err != nil {
-		return err
-	}
-
-	return nil
 }
