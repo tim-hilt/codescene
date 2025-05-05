@@ -69,6 +69,7 @@ func Analyze(db *sql.DB, repo string, force bool, commitCompletedCallback func(c
 	}
 
 	filesystem := memfs.New()
+	log.Info().Str("repo", repo).Msg("Cloning repository")
 	r, err := git.Clone(memory.NewStorage(), filesystem, &git.CloneOptions{
 		URL: "https://" + repo,
 	})
@@ -91,12 +92,31 @@ func Analyze(db *sql.DB, repo string, force bool, commitCompletedCallback func(c
 	}
 
 	commits := make([]*object.Commit, 0)
+
+	log.Info().Str("repo", repo).Msg("Injecting new commits")
+
 	if err = cIter.ForEach(func(c *object.Commit) error {
+		hash := c.Hash.String()
+		_, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
+			hash,
+			c.Author.Name,
+			c.Author.When.Unix(),
+			repo,
+		)
+
+		if err != nil && strings.Contains(err.Error(), "Duplicate key") {
+			return nil
+		} else if err != nil {
+			return err
+		}
+
 		commits = append(commits, c)
 		return nil
 	}); err != nil {
 		return err
 	}
+
+	log.Info().Str("repo", repo).Int("newCommits", len(commits)).Msg("New commits injected")
 
 	worktree, err := r.Worktree()
 	if err != nil {
@@ -110,25 +130,6 @@ func Analyze(db *sql.DB, repo string, force bool, commitCompletedCallback func(c
 		defer close(errs)
 
 		for i, c := range commits {
-			hash := c.Hash.String()
-			mu.Lock()
-			// TODO: Maybe I should do this in the cIter function above, so that I have a list of commits that I REALLY
-			// have to analyze. This would allow for better reporting in the callback.
-			_, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
-				hash,
-				c.Author.Name,
-				c.Author.When.Unix(),
-				repo,
-			)
-			mu.Unlock()
-
-			if err != nil && strings.Contains(err.Error(), "Duplicate key") {
-				continue
-			} else if err != nil {
-				errs <- err
-				return
-			}
-
 			if err := worktree.Checkout(&git.CheckoutOptions{
 				Hash: c.Hash,
 			}); err != nil {
