@@ -22,7 +22,6 @@ func commitCompletedCallback(curr, total int) {
 }
 
 func main() {
-
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	repos, force := parseFlags()
 	if len(repos) == 0 {

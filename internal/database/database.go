@@ -41,11 +41,7 @@ func Init() (*sql.DB, *duckdb.Appender, error) {
 					sloc INTEGER NOT NULL,
 					cloc INTEGER NOT NULL,
 					blank INTEGER NOT NULL,
-					lines_added INTEGER NOT NULL,
-					lines_removed INTEGER NOT NULL,
-					complexity INTEGER NOT NULL,
-					blame_authors TEXT[] NOT NULL,
-					blame_dates TIMESTAMP_S[] NOT NULL
+					complexity INTEGER NOT NULL
 				);`
 
 	if _, err = db.Exec(createTablesStmt); err != nil {
@@ -120,17 +116,10 @@ type CommitFrequency struct {
 	Commits int    `json:"commits"`
 }
 
-type LineSurvival struct {
-	CommitDate string `json:"commitDate"`
-	Year       int    `json:"year"`
-	Loc        int    `json:"loc"`
-}
-
 type ProjectMetadata struct {
 	CommitData      []CommitData      `json:"commitData"`
 	ContributorData []ContributorData `json:"contributorData"`
 	CommitFrequency []CommitFrequency `json:"commitFrequency"`
-	LineSurvival    []LineSurvival    `json:"lineSurvival"`
 }
 
 func GetProjectMetadata(db *sql.DB, project string) (ProjectMetadata, error) {
@@ -210,63 +199,11 @@ func GetProjectMetadata(db *sql.DB, project string) (ProjectMetadata, error) {
 		}
 		commitFrequency = append(commitFrequency, cf)
 	}
-	query := `
-	WITH commit_file_years AS (
-		-- Join commits and filestates, then extract years from blame_dates
-		SELECT 
-			c.author_date,
-			unnest(list_transform(f.blame_dates, x -> extract('year' FROM x))) AS year
-		FROM 
-			commits c
-			JOIN filestates f ON c.hash = f.commit_hash
-		WHERE 
-			c.project = ?
-	),
-	-- Count occurrences of each year per author_date
-	commit_year_counts AS (
-		SELECT 
-			author_date,
-			year,
-			COUNT(*) AS occurrence_count
-		FROM commit_file_years
-		GROUP BY author_date, year
-	)
-
-	-- Final result with one row per author_date-year combination
-	SELECT 
-		author_date,
-		year,
-		occurrence_count
-	FROM commit_year_counts
-	ORDER BY author_date, year`
-
-	rows, err = db.Query(query, project)
-	if err != nil {
-		return ProjectMetadata{}, err
-	}
-
-	var lineSurvival []LineSurvival
-	for rows.Next() {
-		var ls LineSurvival
-		if err := rows.Scan(&ls.CommitDate, &ls.Year, &ls.Loc); err != nil {
-			return ProjectMetadata{}, err
-		}
-		lineSurvival = append(lineSurvival, ls)
-	}
-
-	if err := rows.Err(); err != nil {
-		return ProjectMetadata{}, err
-	}
-	slices.SortFunc(lineSurvival,
-		func(a, b LineSurvival) int {
-			return cmp.Compare(a.CommitDate, b.CommitDate)
-		})
 
 	return ProjectMetadata{
 		CommitData:      commitData,
 		ContributorData: contributorData,
 		CommitFrequency: commitFrequency,
-		LineSurvival:    lineSurvival,
 	}, nil
 }
 

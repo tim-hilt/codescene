@@ -285,59 +285,12 @@ func processFile(appender *duckdb.Appender, file FileState) error {
 		return nil
 	}
 
-	stats, err := statsToMap(file.Commit)
-	if err != nil {
-		return err
-	}
-
-	linesAdded, linesDeleted := 0, 0
-	if stat, ok := stats[file.Location]; ok {
-		linesAdded = stat.Addition
-		linesDeleted = stat.Deletion
-	}
-
-	blameAuthors, blameDates, err := blameToLists(file.Commit, file.Location)
-	if err != nil {
-		return err
-	}
-
 	mut.Lock()
 	defer mut.Unlock()
-	if err = appender.AppendRow(file.Commit.Hash.String(), file.Location, file.Language, int32(file.Code), int32(file.Comment), int32(file.Blank), int32(linesAdded), int32(linesDeleted), int32(file.Complexity), blameAuthors, blameDates); err != nil {
+	if err := appender.AppendRow(file.Commit.Hash.String(), file.Location, file.Language, int32(file.Code), int32(file.Comment), int32(file.Blank), int32(file.Complexity)); err != nil {
 		return err
 	}
 	// PERF: Could improve performance by configuring gc
 	// PERF: Could improve performance by passing around more pointers instead of values, esp. for FileState
 	return nil
-}
-
-func statsToMap(commit *object.Commit) (map[string]object.FileStat, error) {
-	stats, err := commit.Stats()
-	if err != nil {
-		return nil, err
-	}
-
-	statsMap := make(map[string]object.FileStat, len(stats))
-	for _, stat := range stats {
-		statsMap[stat.Name] = stat
-	}
-
-	return statsMap, nil
-}
-
-func blameToLists(commit *object.Commit, fileName string) ([]string, []time.Time, error) {
-	blame, err := git.Blame(commit, fileName)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	var authors []string
-	var dates []time.Time
-
-	for _, line := range blame.Lines {
-		authors = append(authors, line.AuthorName)
-		dates = append(dates, line.Date)
-	}
-
-	return authors, dates, nil
 }
