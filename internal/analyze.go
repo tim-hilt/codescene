@@ -8,12 +8,13 @@ import (
 	"net/url"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/boyter/scc/v3/processor"
 	"github.com/go-git/go-billy/v5"
+	"github.com/marcboeker/go-duckdb/v2"
 
 	"github.com/go-git/go-billy/v5/memfs"
 	"github.com/go-git/go-billy/v5/util"
@@ -30,6 +31,8 @@ type FileState struct {
 	Commit *object.Commit
 	*processor.FileJob
 }
+
+var mut sync.Mutex
 
 func sanitizeRepo(repo string) (string, error) {
 	u, err := url.Parse(repo)
@@ -53,7 +56,7 @@ func sanitizeRepo(repo string) (string, error) {
 	return repo, nil
 }
 
-func Analyze(db *sql.DB, repo string, force bool, commitCompletedCallback func(curr, total int)) error {
+func Analyze(db *sql.DB, appender *duckdb.Appender, repo string, force bool, commitCompletedCallback func(curr, total int)) error {
 
 	repo, err := sanitizeRepo(repo)
 	if err != nil {
@@ -97,12 +100,14 @@ func Analyze(db *sql.DB, repo string, force bool, commitCompletedCallback func(c
 
 	if err = cIter.ForEach(func(c *object.Commit) error {
 		hash := c.Hash.String()
+		mut.Lock()
 		_, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
 			hash,
 			c.Author.Name,
-			c.Author.When.Unix(),
+			c.Committer.When.Format(time.RFC3339),
 			repo,
 		)
+		mut.Unlock()
 
 		if err != nil && strings.Contains(err.Error(), "Duplicate key") {
 			return nil
@@ -140,12 +145,16 @@ func Analyze(db *sql.DB, repo string, force bool, commitCompletedCallback func(c
 			input := make(chan FileState, runtime.NumCPU())
 			go findFiles(filesystem, c, input, errs)
 
-			process(db, filesystem, input, errs)
+			process(appender, filesystem, input, errs)
 			commitCompletedCallback(i+1, len(commits))
 		}
 	}()
 
 	for err := range errs {
+		return err
+	}
+
+	if err = appender.Flush(); err != nil {
 		return err
 	}
 
@@ -219,13 +228,8 @@ func newFileJob(path string, info fs.FileInfo) *processor.FileJob {
 	return nil
 }
 
-func process(db *sql.DB, filesystem billy.Filesystem, input chan FileState, errs chan error) {
+func process(appender *duckdb.Appender, filesystem billy.Filesystem, input chan FileState, errs chan error) {
 	var wg sync.WaitGroup
-
-	stmt, err := db.Prepare("INSERT INTO filestates (commit_hash, path, language, sloc, cloc, blank, lines_added, lines_removed, complexity, blame_authors, blame_dates) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-	if err != nil {
-		errs <- err
-	}
 
 	for i := 0; i < runtime.NumCPU(); i++ {
 		wg.Add(1)
@@ -243,7 +247,7 @@ func process(db *sql.DB, filesystem billy.Filesystem, input chan FileState, errs
 					errs <- err
 					return
 				}
-				if err = processFile(stmt, file); err != nil && err.Error() != "Missing #!" {
+				if err = processFile(appender, file); err != nil && err.Error() != "Missing #!" {
 					errs <- err
 					return
 				}
@@ -254,9 +258,7 @@ func process(db *sql.DB, filesystem billy.Filesystem, input chan FileState, errs
 	wg.Wait()
 }
 
-var mu sync.Mutex
-
-func processFile(stmt *sql.Stmt, file FileState) error {
+func processFile(appender *duckdb.Appender, file FileState) error {
 	file.Language = processor.DetermineLanguage(file.Filename, file.Language, file.PossibleLanguages, file.Content)
 	if file.Language == processor.SheBang {
 
@@ -299,7 +301,11 @@ func processFile(stmt *sql.Stmt, file FileState) error {
 		return err
 	}
 
-	stmt.Exec(file.Commit.Hash.String(), file.Location, file.Language, file.Code, file.Comment, file.Blank, linesAdded, linesDeleted, file.Complexity, blameAuthors, blameDates)
+	mut.Lock()
+	defer mut.Unlock()
+	if err = appender.AppendRow(file.Commit.Hash.String(), file.Location, file.Language, int32(file.Code), int32(file.Comment), int32(file.Blank), int32(linesAdded), int32(linesDeleted), int32(file.Complexity), blameAuthors, blameDates); err != nil {
+		return err
+	}
 	// PERF: Could improve performance by configuring gc
 	// PERF: Could improve performance by passing around more pointers instead of values, esp. for FileState
 	return nil
@@ -319,21 +325,19 @@ func statsToMap(commit *object.Commit) (map[string]object.FileStat, error) {
 	return statsMap, nil
 }
 
-func blameToLists(commit *object.Commit, fileName string) (string, string, error) {
+func blameToLists(commit *object.Commit, fileName string) ([]string, []time.Time, error) {
 	blame, err := git.Blame(commit, fileName)
 	if err != nil {
-		return "", "", err
+		return nil, nil, err
 	}
 
-	authors, dates := "[", "["
+	var authors []string
+	var dates []time.Time
 
 	for _, line := range blame.Lines {
-		authors += "'" + line.AuthorName + "', "
-		dates += strconv.FormatInt(line.Date.Unix(), 10) + ", "
+		authors = append(authors, line.AuthorName)
+		dates = append(dates, line.Date)
 	}
-
-	authors = strings.TrimSuffix(authors, ", ") + "]"
-	dates = strings.TrimSuffix(dates, ", ") + "]"
 
 	return authors, dates, nil
 }

@@ -1,23 +1,37 @@
 package database
 
 import (
+	"cmp"
+	"context"
 	"database/sql"
+	"errors"
+	"slices"
+	"time"
 
-	_ "github.com/marcboeker/go-duckdb/v2"
+	"github.com/marcboeker/go-duckdb/v2"
 )
 
-func Init() (*sql.DB, error) {
-	db, err := sql.Open("duckdb", "codescene.db")
+var ErrProjectNotFound = errors.New("project not found")
+
+func Init() (*sql.DB, *duckdb.Appender, error) {
+	c, err := duckdb.NewConnector("codescene.db", nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+
+	con, err := c.Connect(context.Background())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	db := sql.OpenDB(c)
 
 	// TODO: Do I need a primary key for the filestates?
 	createTablesStmt := `
 				CREATE TABLE IF NOT EXISTS commits (
 					hash TEXT PRIMARY KEY UNIQUE,
 					contributor TEXT NOT NULL,
-					author_date INTEGER NOT NULL,
+					author_date TIMESTAMP_S NOT NULL,
 					project TEXT NOT NULL
 				);
 				CREATE TABLE IF NOT EXISTS filestates (
@@ -31,14 +45,18 @@ func Init() (*sql.DB, error) {
 					lines_removed INTEGER NOT NULL,
 					complexity INTEGER NOT NULL,
 					blame_authors TEXT[] NOT NULL,
-					blame_dates INTEGER[] NOT NULL
+					blame_dates TIMESTAMP_S[] NOT NULL
 				);`
 
 	if _, err = db.Exec(createTablesStmt); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	a, err := duckdb.NewAppenderFromConn(con, "", "filestates")
+	if err != nil {
+		return nil, nil, err
 	}
 
-	return db, nil
+	return db, a, nil
 }
 
 func Clean(db *sql.DB, repo string) error {
@@ -61,4 +79,209 @@ func Clean(db *sql.DB, repo string) error {
 	}
 
 	return nil
+}
+
+func GetProjects(db *sql.DB) ([]string, error) {
+	rows, err := db.Query("SELECT DISTINCT project FROM commits")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var projects []string
+	for rows.Next() {
+		var project string
+		if err := rows.Scan(&project); err != nil {
+			return nil, err
+		}
+		projects = append(projects, project)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return projects, nil
+}
+
+type CommitData struct {
+	CommitDate string `json:"commitDate"`
+	Sloc       int    `json:"sloc"`
+	Complexity int    `json:"complexity"`
+}
+
+type ContributorData struct {
+	Contributor string `json:"contributor"`
+	Commits     int    `json:"commits"`
+}
+
+type CommitFrequency struct {
+	Day     string `json:"day"`
+	Commits int    `json:"commits"`
+}
+
+type LineSurvival struct {
+	CommitDate string `json:"commitDate"`
+	Year       int    `json:"year"`
+	Loc        int    `json:"loc"`
+}
+
+type ProjectMetadata struct {
+	CommitData      []CommitData      `json:"commitData"`
+	ContributorData []ContributorData `json:"contributorData"`
+	CommitFrequency []CommitFrequency `json:"commitFrequency"`
+	LineSurvival    []LineSurvival    `json:"lineSurvival"`
+}
+
+func GetProjectMetadata(db *sql.DB, project string) (ProjectMetadata, error) {
+	rows, err := db.Query(`
+	SELECT 
+		c.author_date,
+		(SELECT SUM(f.complexity) 
+		 FROM filestates f 
+		 WHERE f.commit_hash = c.hash) AS total_complexity,
+		(SELECT SUM(f.sloc) 
+		 FROM filestates f 
+		 WHERE f.commit_hash = c.hash) AS total_sloc
+	FROM 
+		commits c
+	WHERE 
+		c.project = ?`, project)
+	if err != nil {
+		return ProjectMetadata{}, err
+	}
+	defer rows.Close()
+
+	var commitData []CommitData
+	for rows.Next() {
+		var cd CommitData
+		if err := rows.Scan(&cd.CommitDate, &cd.Complexity, &cd.Sloc); err != nil {
+			return ProjectMetadata{}, err
+		}
+		commitData = append(commitData, cd)
+	}
+
+	if err := rows.Err(); err != nil {
+		return ProjectMetadata{}, err
+	}
+
+	if len(commitData) == 0 {
+		return ProjectMetadata{}, ErrProjectNotFound
+	}
+
+	slices.SortFunc(commitData,
+		func(a, b CommitData) int {
+			return cmp.Compare(a.CommitDate, b.CommitDate)
+		})
+
+	rows, err = db.Query("SELECT contributor, COUNT(*) as num_commits FROM commits WHERE project = ? GROUP BY contributor ORDER BY num_commits DESC", project)
+	if err != nil {
+		return ProjectMetadata{}, err
+	}
+
+	var contributorData []ContributorData
+	for rows.Next() {
+		var cd ContributorData
+		if err := rows.Scan(&cd.Contributor, &cd.Commits); err != nil {
+			return ProjectMetadata{}, err
+		}
+		contributorData = append(contributorData, cd)
+	}
+
+	if err := rows.Err(); err != nil {
+		return ProjectMetadata{}, err
+	}
+
+	var commitFrequency []CommitFrequency
+	firstCommit, err := time.Parse(time.RFC3339, commitData[0].CommitDate)
+	if err != nil {
+		return ProjectMetadata{}, nil
+	}
+	firstCommit = firstCommit.Truncate(24 * time.Hour)
+	today := time.Now().Truncate(24 * time.Hour)
+	for d := firstCommit; !d.After(today); d = d.AddDate(0, 0, 1) {
+		commits, err := countTimestampsOnDay(commitData, d)
+		if err != nil {
+			return ProjectMetadata{}, err
+		}
+		cf := CommitFrequency{
+			Day:     d.Format(time.RFC3339),
+			Commits: commits,
+		}
+		commitFrequency = append(commitFrequency, cf)
+	}
+	query := `
+	WITH commit_file_years AS (
+		-- Join commits and filestates, then extract years from blame_dates
+		SELECT 
+			c.author_date,
+			unnest(list_transform(f.blame_dates, x -> extract('year' FROM x))) AS year
+		FROM 
+			commits c
+			JOIN filestates f ON c.hash = f.commit_hash
+		WHERE 
+			c.project = ?
+	),
+	-- Count occurrences of each year per author_date
+	commit_year_counts AS (
+		SELECT 
+			author_date,
+			year,
+			COUNT(*) AS occurrence_count
+		FROM commit_file_years
+		GROUP BY author_date, year
+	)
+
+	-- Final result with one row per author_date-year combination
+	SELECT 
+		author_date,
+		year,
+		occurrence_count
+	FROM commit_year_counts
+	ORDER BY author_date, year`
+
+	rows, err = db.Query(query, project)
+	if err != nil {
+		return ProjectMetadata{}, err
+	}
+
+	var lineSurvival []LineSurvival
+	for rows.Next() {
+		var ls LineSurvival
+		if err := rows.Scan(&ls.CommitDate, &ls.Year, &ls.Loc); err != nil {
+			return ProjectMetadata{}, err
+		}
+		lineSurvival = append(lineSurvival, ls)
+	}
+
+	if err := rows.Err(); err != nil {
+		return ProjectMetadata{}, err
+	}
+	slices.SortFunc(lineSurvival,
+		func(a, b LineSurvival) int {
+			return cmp.Compare(a.CommitDate, b.CommitDate)
+		})
+
+	return ProjectMetadata{
+		CommitData:      commitData,
+		ContributorData: contributorData,
+		CommitFrequency: commitFrequency,
+		LineSurvival:    lineSurvival,
+	}, nil
+}
+
+func countTimestampsOnDay(commitData []CommitData, day time.Time) (int, error) {
+	day = day.Truncate(24 * time.Hour)
+	count := 0
+
+	for _, cd := range commitData {
+		t, err := time.Parse(time.RFC3339, cd.CommitDate)
+		if err != nil {
+			return -1, err
+		}
+		if t.Truncate(24 * time.Hour).Equal(day) {
+			count++
+		}
+	}
+	return count, nil
 }
