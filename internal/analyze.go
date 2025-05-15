@@ -26,8 +26,9 @@ import (
 )
 
 type FileState struct {
-	Commit *object.Commit
+	*object.Commit
 	*processor.FileJob
+	Stats *map[string]object.FileStat
 }
 
 var mut sync.Mutex
@@ -104,7 +105,7 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 		_, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
 			hash,
 			c.Author.Name,
-			c.Committer.When.Format(time.RFC3339),
+			c.Author.When.Format(time.RFC3339),
 			repo,
 		)
 		mut.Unlock()
@@ -162,7 +163,15 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 }
 
 func findFiles(filesystem billy.Filesystem, commit *object.Commit, files chan FileState, errs chan error) {
-	err := util.Walk(filesystem, ".", func(path string, info fs.FileInfo, err error) error {
+	defer close(files)
+
+	stats, err := statsToMap(commit)
+	if err != nil {
+		errs <- err
+		return
+	}
+
+	if err := util.Walk(filesystem, ".", func(path string, info fs.FileInfo, err error) error {
 		if info.IsDir() {
 			// Not interested in directories
 			return nil
@@ -177,14 +186,12 @@ func findFiles(filesystem billy.Filesystem, commit *object.Commit, files chan Fi
 		files <- FileState{
 			Commit:  commit,
 			FileJob: f,
+			Stats:   &stats,
 		}
 		return nil
-	})
-	if err != nil {
+	}); err != nil {
 		errs <- err
 	}
-
-	close(files)
 }
 
 var LargeByteCount int64 = 1000000
@@ -285,12 +292,28 @@ func processFile(db *database.DB, file FileState) error {
 		return nil
 	}
 
+	stat := (*file.Stats)[file.Location]
+
 	mut.Lock()
 	defer mut.Unlock()
-	if err := db.AppendRow(file.Commit.Hash.String(), file.Location, file.Language, int32(file.Code), int32(file.Comment), int32(file.Blank), int32(file.Complexity)); err != nil {
+	if err := db.AppendRow(file.Commit.Hash.String(), file.Location, file.Language, int32(file.Code), int32(file.Comment), int32(file.Blank), int32(file.Complexity), int32(stat.Addition), int32(stat.Deletion)); err != nil {
 		return err
 	}
 	// PERF: Could improve performance by configuring gc
 	// PERF: Could improve performance by passing around more pointers instead of values, esp. for FileState
 	return nil
+}
+
+func statsToMap(commit *object.Commit) (map[string]object.FileStat, error) {
+	stats, err := commit.Stats()
+	if err != nil {
+		return nil, err
+	}
+
+	statsMap := make(map[string]object.FileStat, len(stats))
+	for _, stat := range stats {
+		statsMap[stat.Name] = stat
+	}
+
+	return statsMap, nil
 }

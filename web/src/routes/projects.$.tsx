@@ -20,17 +20,10 @@ type CommitFrequency = {
 	commits: number;
 };
 
-type LineSurvival = {
-	commitDate: Date;
-	year: number;
-	loc: number;
-};
-
 type ProjectMetadata = {
 	commitData: Array<CommitData>;
 	contributorData: Array<ContributorData>;
 	commitFrequency: Array<CommitFrequency>;
-	lineSurvival: Array<LineSurvival>;
 };
 
 export const Route = createFileRoute("/projects/$")({
@@ -55,10 +48,6 @@ function RouteComponent() {
 	data.commitFrequency = data.commitFrequency.map((cf) => ({
 		...cf,
 		day: new Date(cf.day),
-	}));
-	data.lineSurvival = data.lineSurvival.map((ls) => ({
-		...ls,
-		commitDate: new Date(ls.commitDate),
 	}));
 
 	const contributorData = data.contributorData.slice(undefined, 30);
@@ -168,7 +157,7 @@ function RouteComponent() {
 					],
 				}}
 			/>
-			<PlotFigure
+			{/* <PlotFigure
 				options={{
 					title: "Line Survival",
 					color: {
@@ -192,7 +181,7 @@ function RouteComponent() {
 						}),
 					],
 				}}
-			/>
+			/> */}
 			<div className="mx-auto">
 				<PlotFigure
 					options={{

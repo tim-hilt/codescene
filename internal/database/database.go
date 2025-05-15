@@ -64,7 +64,9 @@ func Init() (*DB, error) {
 					sloc INTEGER NOT NULL,
 					cloc INTEGER NOT NULL,
 					blank INTEGER NOT NULL,
-					complexity INTEGER NOT NULL
+					complexity INTEGER NOT NULL,
+					lines_added INTEGER NOT NULL,
+					lines_deleted INTEGER NOT NULL,
 				);`
 
 	if _, err = db.Exec(createTablesStmt); err != nil {
