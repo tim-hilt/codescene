@@ -7,20 +7,17 @@ import (
 	"io/fs"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/boyter/scc/v3/processor"
-	"github.com/go-git/go-billy/v5"
 	"github.com/marcboeker/go-duckdb/v2"
 
-	"github.com/go-git/go-billy/v5/memfs"
-	"github.com/go-git/go-billy/v5/util"
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/rs/zerolog/log"
 
 	// TODO: Try to get arrow support working
@@ -28,7 +25,7 @@ import (
 )
 
 type FileState struct {
-	Commit *object.Commit
+	Commit Commit
 	*processor.FileJob
 }
 
@@ -71,62 +68,45 @@ func Analyze(db *sql.DB, appender *duckdb.Appender, repo string, force bool, com
 		}
 	}
 
-	filesystem := memfs.New()
 	log.Info().Str("repo", repo).Msg("Cloning repository")
-	r, err := git.Clone(memory.NewStorage(), filesystem, &git.CloneOptions{
-		URL: "https://" + repo,
-	})
+	tmp, err := os.MkdirTemp("", "")
+	defer os.RemoveAll(tmp)
 
 	if err != nil {
 		return err
 	}
 
-	ref, err := r.Head()
-	if err != nil {
+	if err = gitClone("https://"+repo, tmp); err != nil {
 		return err
 	}
 
-	cIter, err := r.Log(&git.LogOptions{
-		From: ref.Hash(),
-	})
+	commits, err := gitLog(tmp)
 
 	if err != nil {
 		return err
 	}
-
-	commits := make([]*object.Commit, 0)
 
 	log.Info().Str("repo", repo).Msg("Injecting new commits")
 
-	if err = cIter.ForEach(func(c *object.Commit) error {
-		hash := c.Hash.String()
+	for _, commit := range commits {
 		mut.Lock()
 		_, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
-			hash,
-			c.Author.Name,
-			c.Committer.When.Format(time.RFC3339),
+			commit.Hash,
+			commit.Author,
+			commit.Date,
 			repo,
 		)
 		mut.Unlock()
 
 		if err != nil && strings.Contains(err.Error(), "Duplicate key") {
-			return nil
+			continue
 		} else if err != nil {
 			return err
 		}
-
-		commits = append(commits, c)
-		return nil
-	}); err != nil {
-		return err
 	}
 
 	log.Info().Str("repo", repo).Int("newCommits", len(commits)).Msg("New commits injected")
 
-	worktree, err := r.Worktree()
-	if err != nil {
-		return err
-	}
 	processor.ProcessConstants()
 
 	errs := make(chan error)
@@ -135,17 +115,15 @@ func Analyze(db *sql.DB, appender *duckdb.Appender, repo string, force bool, com
 		defer close(errs)
 
 		for i, c := range commits {
-			if err := worktree.Checkout(&git.CheckoutOptions{
-				Hash: c.Hash,
-			}); err != nil {
+			if err := gitCheckout(tmp, c.Hash); err != nil {
 				errs <- err
 				return
 			}
 
 			input := make(chan FileState, runtime.NumCPU())
-			go findFiles(filesystem, c, input, errs)
+			go findFiles(tmp, c, input, errs)
 
-			process(appender, filesystem, input, errs)
+			process(appender, input, errs)
 			commitCompletedCallback(i+1, len(commits))
 		}
 	}()
@@ -161,8 +139,8 @@ func Analyze(db *sql.DB, appender *duckdb.Appender, repo string, force bool, com
 	return nil
 }
 
-func findFiles(filesystem billy.Filesystem, commit *object.Commit, files chan FileState, errs chan error) {
-	err := util.Walk(filesystem, ".", func(path string, info fs.FileInfo, err error) error {
+func findFiles(tmpDir string, commit Commit, files chan FileState, errs chan error) {
+	err := filepath.Walk(tmpDir, func(path string, info fs.FileInfo, err error) error {
 		if info.IsDir() {
 			// Not interested in directories
 			return nil
@@ -228,7 +206,7 @@ func newFileJob(path string, info fs.FileInfo) *processor.FileJob {
 	return nil
 }
 
-func process(appender *duckdb.Appender, filesystem billy.Filesystem, input chan FileState, errs chan error) {
+func process(appender *duckdb.Appender, input chan FileState, errs chan error) {
 	var wg sync.WaitGroup
 
 	for i := 0; i < runtime.NumCPU(); i++ {
@@ -237,7 +215,7 @@ func process(appender *duckdb.Appender, filesystem billy.Filesystem, input chan 
 			defer wg.Done()
 			for file := range input {
 				loc := file.Location
-				f, err := filesystem.Open(loc)
+				f, err := os.Open(loc)
 				if err != nil {
 					errs <- err
 					return
@@ -287,10 +265,113 @@ func processFile(appender *duckdb.Appender, file FileState) error {
 
 	mut.Lock()
 	defer mut.Unlock()
-	if err := appender.AppendRow(file.Commit.Hash.String(), file.Location, file.Language, int32(file.Code), int32(file.Comment), int32(file.Blank), int32(file.Complexity)); err != nil {
+	if err := appender.AppendRow(file.Commit.Hash, file.Location, file.Language, int32(file.Code), int32(file.Comment), int32(file.Blank), int32(file.Complexity)); err != nil {
 		return err
 	}
 	// PERF: Could improve performance by configuring gc
 	// PERF: Could improve performance by passing around more pointers instead of values, esp. for FileState
 	return nil
+}
+
+type FileChange struct {
+	Path         string
+	LinesAdded   int64
+	LinesRemoved int64
+	RenameFrom   string
+}
+
+type Commit struct {
+	Hash        string
+	Author      string
+	Date        string
+	FileChanges []FileChange
+}
+
+func gitClone(repo, destination string) error {
+	cmd := exec.Command("git", "clone", "--single-branch", "--no-tags", repo, destination)
+	return cmd.Run()
+}
+
+func gitLog(repo string) ([]Commit, error) {
+	cmd := exec.Command("git", "log", "--no-merges", "--diff-filter=ACMRTUXB", "--numstat", "--pretty=format:'%H;%cI;%an'")
+	cmd.Dir = repo
+
+	stdout, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(stdout) == 0 {
+		return []Commit{}, nil
+	}
+
+	commitsString := string(stdout)
+	commitStrings := strings.Split(commitsString, "\n\n")
+	commits := make([]Commit, len(commitStrings))
+
+	for i, commitString := range commitStrings {
+		commit, err := parseCommit(commitString)
+		if err != nil {
+			return nil, err
+		}
+		commits[i] = commit
+	}
+
+	return commits, nil
+}
+
+func parseCommit(commitString string) (Commit, error) {
+	lines := strings.Split(commitString, "\n")
+	fileChanges := make([]FileChange, len(lines)-1)
+
+	for j, line := range lines[1:] {
+		fileChange := strings.Split(line, "\t")
+		if fileChange[0] == "-" && fileChange[1] == "-" || line == "" {
+			// Don't record binary files, skip empty lines
+			continue
+		}
+		linesAdded, err := strconv.ParseInt(fileChange[0], 10, 64)
+		if err != nil {
+			return Commit{}, err
+		}
+		linesRemoved, err := strconv.ParseInt(fileChange[1], 10, 64)
+		if err != nil {
+			return Commit{}, err
+		}
+		renameFrom, path := getRenamedPaths(fileChange[2])
+		fileChanges[j] = FileChange{
+			Path:         path,
+			LinesAdded:   linesAdded,
+			LinesRemoved: linesRemoved,
+			RenameFrom:   renameFrom,
+		}
+	}
+	// TODO: Find out, why git surrounds pretty format with \'...\'
+	commitData := strings.Split(strings.Trim(lines[0], "'"), ";")
+	commit := Commit{
+		Hash:        commitData[0],
+		Author:      commitData[2],
+		Date:        commitData[1],
+		FileChanges: fileChanges,
+	}
+	return commit, nil
+}
+
+func getRenamedPaths(input string) (string, string) {
+	re := regexp.MustCompile(`\{([^}]+) => ([^}]+)\}`)
+	match := re.FindStringSubmatch(input)
+	if match == nil {
+		return input, input
+	}
+	before, after := match[1], match[2]
+	replaced1 := strings.Replace(input, match[0], before, 1)
+	replaced2 := strings.Replace(input, match[0], after, 1)
+
+	return replaced1, replaced2
+}
+
+func gitCheckout(repo, hash string) error {
+	cmd := exec.Command("git", "checkout", hash)
+	cmd.Dir = repo
+	return cmd.Run()
 }

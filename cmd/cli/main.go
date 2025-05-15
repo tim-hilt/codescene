@@ -2,6 +2,8 @@ package main
 
 import (
 	"flag"
+	"os"
+	"runtime/pprof"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -22,6 +24,9 @@ func commitCompletedCallback(curr, total int) {
 }
 
 func main() {
+	f, _ := os.Create("cpu.pprof")
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	repos, force := parseFlags()
 	if len(repos) == 0 {
