@@ -2,6 +2,8 @@ package main
 
 import (
 	"flag"
+	"os"
+	"runtime/pprof"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -22,6 +24,10 @@ func commitCompletedCallback(curr, total int) {
 }
 
 func main() {
+	f, _ := os.Create("cpu.pprof")
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
+
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	repos, force := parseFlags()
 	if len(repos) == 0 {
@@ -29,17 +35,16 @@ func main() {
 		return
 	}
 
-	db, appender, err := database.Init()
+	db, err := database.Init()
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize database")
 		return
 	}
 	defer db.Close()
-	defer appender.Close()
 
 	for _, repo := range repos {
 		start := time.Now()
-		if err := internal.Analyze(db, appender, repo, force, commitCompletedCallback); err != nil {
+		if err := internal.Analyze(db, repo, force, commitCompletedCallback); err != nil {
 			log.Err(err).Msg("Failed to analyze")
 			return
 		}

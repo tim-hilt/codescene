@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"slices"
 	"time"
@@ -13,15 +14,37 @@ import (
 
 var ErrProjectNotFound = errors.New("project not found")
 
-func Init() (*sql.DB, *duckdb.Appender, error) {
+type DB struct {
+	*sql.DB
+	*duckdb.Appender
+	driver.Conn
+}
+
+func (db *DB) Close() error {
+	if err := db.Appender.Close(); err != nil {
+		return err
+	}
+
+	if err := db.Conn.Close(); err != nil {
+		return err
+	}
+
+	if err := db.DB.Close(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func Init() (*DB, error) {
 	c, err := duckdb.NewConnector("codescene.db", nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	con, err := c.Connect(context.Background())
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	db := sql.OpenDB(c)
@@ -45,17 +68,17 @@ func Init() (*sql.DB, *duckdb.Appender, error) {
 				);`
 
 	if _, err = db.Exec(createTablesStmt); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	a, err := duckdb.NewAppenderFromConn(con, "", "filestates")
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	return db, a, nil
+	return &DB{db, a, con}, nil
 }
 
-func Clean(db *sql.DB, repo string) error {
+func (db *DB) Clean(repo string) error {
 	deleteFileStatesStmt := `
     DELETE FROM filestates
     WHERE commit_hash IN (
@@ -77,7 +100,7 @@ func Clean(db *sql.DB, repo string) error {
 	return nil
 }
 
-func GetProjects(db *sql.DB) ([]string, error) {
+func (db *DB) GetProjects() ([]string, error) {
 	rows, err := db.Query("SELECT DISTINCT project FROM commits")
 	if err != nil {
 		return nil, err
@@ -122,7 +145,7 @@ type ProjectMetadata struct {
 	CommitFrequency []CommitFrequency `json:"commitFrequency"`
 }
 
-func GetProjectMetadata(db *sql.DB, project string) (ProjectMetadata, error) {
+func (db *DB) GetProjectMetadata(project string) (ProjectMetadata, error) {
 	rows, err := db.Query(`
 	SELECT 
 		c.author_date,

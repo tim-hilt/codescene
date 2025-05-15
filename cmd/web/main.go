@@ -15,21 +15,18 @@ func main() {
 	file, _ := os.Create("./cpu.pprof")
 	pprof.StartCPUProfile(file)
 
-	db, appender, err := database.Init()
+	db, err := database.Init()
 	if err != nil {
 		panic(err)
 	}
 
-	s := &server.Server{DB: db, Appender: appender}
+	s := &server.Server{DB: db}
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	go func() {
 		<-c
 		fmt.Println("Ctrl-C pressed! Exiting...")
-		if err = appender.Close(); err != nil {
-			panic(err)
-		}
 		if err = db.Close(); err != nil {
 			panic(err)
 		}

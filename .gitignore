@@ -1,3 +1,6 @@
 ./codescene
 codescene.db
 codescene.db.wal
+cli
+bench.md
+cpu.pprof

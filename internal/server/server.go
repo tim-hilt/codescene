@@ -1,21 +1,18 @@
 package server
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
 
-	"github.com/marcboeker/go-duckdb/v2"
 	"github.com/tim-hilt/codescene/internal"
 	"github.com/tim-hilt/codescene/internal/database"
 )
 
 type Server struct {
-	DB       *sql.DB
-	Appender *duckdb.Appender
+	*database.DB
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -59,7 +56,7 @@ func (s *Server) analyze(w http.ResponseWriter, r *http.Request) {
 		force = true
 	}
 
-	err := internal.Analyze(s.DB, s.Appender, repo, force, func(c, t int) {
+	err := internal.Analyze(s.DB, repo, force, func(c, t int) {
 		w.Write([]byte("id: " + strconv.Itoa(c) + "\n"))
 		w.Write([]byte(fmt.Sprintf("data: {\"current\":%d,\"total\":%d}\n\n", c, t)))
 		w.(http.Flusher).Flush()
@@ -79,7 +76,7 @@ func (s *Server) projects(w http.ResponseWriter, _ *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	projects, err := database.GetProjects(s.DB)
+	projects, err := s.GetProjects()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -99,7 +96,7 @@ func (s *Server) projectMetadata(w http.ResponseWriter, _ *http.Request, project
 
 	w.Header().Set("Content-Type", "application/json")
 
-	metadata, err := database.GetProjectMetadata(s.DB, project)
+	metadata, err := s.GetProjectMetadata(project)
 
 	if err == database.ErrProjectNotFound {
 		http.Error(w, err.Error(), http.StatusNotFound)

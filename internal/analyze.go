@@ -1,7 +1,6 @@
 package internal
 
 import (
-	"database/sql"
 	"errors"
 	"io"
 	"io/fs"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/boyter/scc/v3/processor"
 	"github.com/go-git/go-billy/v5"
-	"github.com/marcboeker/go-duckdb/v2"
 
 	"github.com/go-git/go-billy/v5/memfs"
 	"github.com/go-git/go-billy/v5/util"
@@ -56,7 +54,7 @@ func sanitizeRepo(repo string) (string, error) {
 	return repo, nil
 }
 
-func Analyze(db *sql.DB, appender *duckdb.Appender, repo string, force bool, commitCompletedCallback func(curr, total int)) error {
+func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback func(curr, total int)) error {
 
 	repo, err := sanitizeRepo(repo)
 	if err != nil {
@@ -66,7 +64,7 @@ func Analyze(db *sql.DB, appender *duckdb.Appender, repo string, force bool, com
 	if force {
 		log.Info().Str("repo", repo).Msg("Force re-analyzing repository, deleting old data")
 
-		if err := database.Clean(db, repo); err != nil {
+		if err := db.Clean(repo); err != nil {
 			return err
 		}
 	}
@@ -74,7 +72,9 @@ func Analyze(db *sql.DB, appender *duckdb.Appender, repo string, force bool, com
 	filesystem := memfs.New()
 	log.Info().Str("repo", repo).Msg("Cloning repository")
 	r, err := git.Clone(memory.NewStorage(), filesystem, &git.CloneOptions{
-		URL: "https://" + repo,
+		URL:          "https://" + repo,
+		Tags:         git.NoTags,
+		SingleBranch: true,
 	})
 
 	if err != nil {
@@ -145,7 +145,7 @@ func Analyze(db *sql.DB, appender *duckdb.Appender, repo string, force bool, com
 			input := make(chan FileState, runtime.NumCPU())
 			go findFiles(filesystem, c, input, errs)
 
-			process(appender, filesystem, input, errs)
+			process(db, filesystem, input, errs)
 			commitCompletedCallback(i+1, len(commits))
 		}
 	}()
@@ -154,7 +154,7 @@ func Analyze(db *sql.DB, appender *duckdb.Appender, repo string, force bool, com
 		return err
 	}
 
-	if err = appender.Flush(); err != nil {
+	if err = db.Flush(); err != nil {
 		return err
 	}
 
@@ -228,7 +228,7 @@ func newFileJob(path string, info fs.FileInfo) *processor.FileJob {
 	return nil
 }
 
-func process(appender *duckdb.Appender, filesystem billy.Filesystem, input chan FileState, errs chan error) {
+func process(db *database.DB, filesystem billy.Filesystem, input chan FileState, errs chan error) {
 	var wg sync.WaitGroup
 
 	for i := 0; i < runtime.NumCPU(); i++ {
@@ -247,7 +247,7 @@ func process(appender *duckdb.Appender, filesystem billy.Filesystem, input chan 
 					errs <- err
 					return
 				}
-				if err = processFile(appender, file); err != nil && err.Error() != "Missing #!" {
+				if err = processFile(db, file); err != nil && err.Error() != "Missing #!" {
 					errs <- err
 					return
 				}
@@ -258,7 +258,7 @@ func process(appender *duckdb.Appender, filesystem billy.Filesystem, input chan 
 	wg.Wait()
 }
 
-func processFile(appender *duckdb.Appender, file FileState) error {
+func processFile(db *database.DB, file FileState) error {
 	file.Language = processor.DetermineLanguage(file.Filename, file.Language, file.PossibleLanguages, file.Content)
 	if file.Language == processor.SheBang {
 
@@ -287,7 +287,7 @@ func processFile(appender *duckdb.Appender, file FileState) error {
 
 	mut.Lock()
 	defer mut.Unlock()
-	if err := appender.AppendRow(file.Commit.Hash.String(), file.Location, file.Language, int32(file.Code), int32(file.Comment), int32(file.Blank), int32(file.Complexity)); err != nil {
+	if err := db.AppendRow(file.Commit.Hash.String(), file.Location, file.Language, int32(file.Code), int32(file.Comment), int32(file.Blank), int32(file.Complexity)); err != nil {
 		return err
 	}
 	// PERF: Could improve performance by configuring gc
