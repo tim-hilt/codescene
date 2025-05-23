@@ -26,7 +26,7 @@ import (
 type FileState struct {
 	Commit
 	*processor.FileJob
-	Stats *map[string]FileChange
+	Stats *FileChange
 }
 
 var mut sync.Mutex
@@ -94,19 +94,22 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 		defer close(errs)
 		for i, commit := range commits {
 			mut.Lock()
-			// db.CommitsAppender.AppendRow(commit.Hash.String(), commit.Author.Name, commit.Author.When.Format(time.RFC3339), repo)
-			// TODO: This could be sped up by using an appender or csv loader
-			_, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project, message) VALUES (?, ?, ?, ?, ?)",
-				commit.Hash,
-				commit.Author,
-				commit.Date,
-				repo,
-				commit.Message,
-			)
+			date, err := time.Parse(time.RFC3339, commit.Date)
+			if err != nil {
+				errs <- err
+				return
+			}
+
+			err = db.CommitsAppender.AppendRow(commit.Hash, commit.Author, date, repo, commit.Message)
 			mut.Unlock()
 
 			if err != nil && strings.Contains(err.Error(), "Duplicate key") {
 				continue
+			}
+
+			if err != nil {
+				errs <- err
+				return
 			}
 
 			if len(commit.FileChanges) == 0 {
@@ -122,7 +125,6 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 
 			input := make(chan FileState, runtime.NumCPU())
 			go findFiles(tmp, commit, input, errs)
-
 			process(db, input, errs)
 			commitCompletedCallback(i+1, len(commits))
 		}
@@ -146,32 +148,29 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 func findFiles(repoPath string, commit Commit, files chan FileState, errs chan error) {
 	defer close(files)
 
-	stats, err := statsToMap(commit)
-	if err != nil {
-		errs <- err
-		return
-	}
+	for _, fileChange := range commit.FileChanges {
+		path := filepath.Join(repoPath, fileChange.Path)
+		info, err := os.Lstat(path)
 
-	if err := filepath.Walk(repoPath, func(path string, info fs.FileInfo, err error) error {
-		if info.IsDir() {
-			// Not interested in directories
-			return nil
+		if err != nil && strings.Contains(err.Error(), "no such file") && fileChange.LinesRemoved > 0 {
+			// File was removed in this commit
+			// TODO: Handle correctly!
+			continue
 		}
+
 		if err != nil {
-			return err
+			errs <- err
+			return
 		}
 		f := newFileJob(path, info)
 		if f == nil {
-			return nil
+			continue
 		}
 		files <- FileState{
 			Commit:  commit,
 			FileJob: f,
-			Stats:   &stats,
+			Stats:   &fileChange,
 		}
-		return nil
-	}); err != nil {
-		errs <- err
 	}
 }
 
@@ -224,17 +223,12 @@ func process(db *database.DB, input chan FileState, errs chan error) {
 		go func() {
 			defer wg.Done()
 			for file := range input {
-				loc := file.Location
-				f, err := os.Open(loc)
-				if err != nil {
-					errs <- err
-					return
-				}
-				_, err = f.Read(file.Content)
+				content, err := os.ReadFile(file.Location)
 				if err != nil && err != io.EOF {
 					errs <- err
 					return
 				}
+				copy(file.Content, content)
 				if err = processFile(db, file); err != nil && err.Error() != "Missing #!" {
 					errs <- err
 					return
@@ -273,27 +267,23 @@ func processFile(db *database.DB, file FileState) error {
 		return nil
 	}
 
-	stat := (*file.Stats)[file.Location]
-
 	mut.Lock()
 	defer mut.Unlock()
-	if err := db.FilestatesAppender.AppendRow(file.Commit.Hash, file.Location, file.Language, int32(file.Code), int32(file.Comment), int32(file.Blank), int32(file.Complexity), int32(stat.LinesAdded), int32(stat.LinesRemoved)); err != nil {
+	if err := db.FilestatesAppender.AppendRow(
+		file.Commit.Hash,
+		file.Location,
+		file.Language,
+		int32(file.Code),
+		int32(file.Comment),
+		int32(file.Blank),
+		int32(file.Complexity),
+		int32(file.Stats.LinesAdded),
+		int32(file.Stats.LinesRemoved),
+	); err != nil {
 		return err
 	}
-	// PERF: Could improve performance by configuring gc
 	// PERF: Could improve performance by passing around more pointers instead of values, esp. for FileState
 	return nil
-}
-
-func statsToMap(commit Commit) (map[string]FileChange, error) {
-	stats := commit.FileChanges
-
-	statsMap := make(map[string]FileChange, len(stats))
-	for _, stat := range stats {
-		statsMap[stat.Path] = stat
-	}
-
-	return statsMap, nil
 }
 
 func gitClone(repo, destination string) error {
@@ -319,7 +309,7 @@ type Commit struct {
 const commitSeparator = "COMMIT_START"
 
 func gitLog(repo string) ([]Commit, error) {
-	cmd := exec.Command("git", "log", "--numstat", "--pretty=format:"+commitSeparator+"%H;%cI;%an;%s")
+	cmd := exec.Command("git", "log", "--reverse", "--numstat", "--pretty=format:"+commitSeparator+"%H;%cI;%an;%s")
 	cmd.Dir = repo
 
 	stdout, err := cmd.Output()
@@ -360,11 +350,6 @@ func parseCommit(commitString string) (Commit, error) {
 		FileChanges: fileChanges,
 	}
 
-	if len(fileChanges) == 0 {
-		// Commit without file changes
-		return commit, nil
-	}
-
 	for j, line := range lines[1:] {
 		fileChange := strings.Split(line, "\t")
 		if fileChange[0] == "-" && fileChange[1] == "-" || line == "" {
@@ -388,21 +373,29 @@ func parseCommit(commitString string) (Commit, error) {
 		}
 	}
 
-	// TODO: Find out, why git surrounds pretty format with \'...\'
 	return commit, nil
 }
 
-func getRenamedPaths(input string) (string, string) {
-	re := regexp.MustCompile(`\{([^}]+) => ([^}]+)\}`)
-	match := re.FindStringSubmatch(input)
-	if match == nil {
-		return input, input
+func getRenamedPaths(path string) (string, string) {
+	// Case 1: {... => ...} within a path segment
+	reBrace := regexp.MustCompile(`\{([^{}]*) => ([^{}]*)\}`)
+	if reBrace.MatchString(path) {
+		match := reBrace.FindStringSubmatch(path)
+		prefix := path[:strings.Index(path, "{")]
+		suffix := path[strings.LastIndex(path, "}")+1:]
+		oldPath := prefix + match[1] + suffix
+		newPath := prefix + match[2] + suffix
+		return oldPath, newPath
 	}
-	before, after := match[1], match[2]
-	replaced1 := strings.Replace(input, match[0], before, 1)
-	replaced2 := strings.Replace(input, match[0], after, 1)
 
-	return replaced1, replaced2
+	// Case 2: Full-path rename with => separator
+	reArrow := regexp.MustCompile(`^(.*) => (.*)$`)
+	if reArrow.MatchString(path) {
+		match := reArrow.FindStringSubmatch(path)
+		return strings.TrimSpace(match[1]), strings.TrimSpace(match[2])
+	}
+
+	return path, path
 }
 
 func gitCheckout(repo, hash string) error {
