@@ -60,7 +60,8 @@ func Init() (*DB, error) {
 					hash TEXT PRIMARY KEY UNIQUE,
 					contributor TEXT NOT NULL,
 					author_date TIMESTAMP_S NOT NULL,
-					project TEXT NOT NULL
+					project TEXT NOT NULL,
+					message TEXT NOT NULL,
 				);
 				CREATE TABLE IF NOT EXISTS filestates (
 					commit_hash TEXT NOT NULL REFERENCES commits(hash),
