@@ -70,24 +70,25 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 		}
 	}
 
-	filesystem := memfs.New()
-	log.Info().Str("repo", repo).Msg("Cloning repository")
-	r, err := git.Clone(memory.NewStorage(), filesystem, &git.CloneOptions{
+	globalFilesystem := memfs.New()
+	start := time.Now()
+	globalRepo, err := git.Clone(memory.NewStorage(), globalFilesystem, &git.CloneOptions{
 		URL:          "https://" + repo,
 		Tags:         git.NoTags,
 		SingleBranch: true,
 	})
+	log.Info().Dur("duration", time.Since(start)).Msg("cloning finished")
 
 	if err != nil {
 		return err
 	}
 
-	ref, err := r.Head()
+	ref, err := globalRepo.Head()
 	if err != nil {
 		return err
 	}
 
-	cIter, err := r.Log(&git.LogOptions{
+	cIter, err := globalRepo.Log(&git.LogOptions{
 		From: ref.Hash(),
 	})
 
@@ -95,67 +96,102 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 		return err
 	}
 
-	commits := make([]*object.Commit, 0)
+	commits := make(chan *object.Commit, runtime.NumCPU())
 
 	log.Info().Str("repo", repo).Msg("Injecting new commits")
-
-	if err = cIter.ForEach(func(c *object.Commit) error {
-		hash := c.Hash.String()
-		mut.Lock()
-		_, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
-			hash,
-			c.Author.Name,
-			c.Author.When.Format(time.RFC3339),
-			repo,
-		)
-		mut.Unlock()
-
-		if err != nil && strings.Contains(err.Error(), "Duplicate key") {
-			return nil
-		} else if err != nil {
-			return err
-		}
-
-		commits = append(commits, c)
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	log.Info().Str("repo", repo).Int("newCommits", len(commits)).Msg("New commits injected")
-
-	worktree, err := r.Worktree()
-	if err != nil {
-		return err
-	}
-	processor.ProcessConstants()
-
 	errs := make(chan error)
 
 	go func() {
 		defer close(errs)
+		defer close(commits)
+		if err = cIter.ForEach(func(c *object.Commit) error {
+			commits <- c
+			return nil
+		}); err != nil {
+			errs <- err
+			return
+		}
+	}()
 
-		for i, c := range commits {
-			if err := worktree.Checkout(&git.CheckoutOptions{
-				Hash: c.Hash,
-			}); err != nil {
+	// TODO: Correct logs
+	log.Info().Str("repo", repo).Int("newCommits", len(commits)).Msg("New commits injected")
+
+	processor.ProcessConstants()
+
+	var wg sync.WaitGroup
+	for i := range runtime.NumCPU() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := globalRepo
+			filesystem := globalFilesystem
+			if i != 0 {
+				// Seperate clone for goroutine 1 - NumCPU
+				filesystem = memfs.New()
+				start := time.Now()
+				r, err = git.Clone(memory.NewStorage(), filesystem, &git.CloneOptions{
+					URL:          "https://github.com/go-git/go-git",
+					SingleBranch: true,
+					Tags:         git.NoTags,
+				})
+				if err != nil {
+					errs <- err
+					return
+				}
+				log.Info().Dur("duration", time.Since(start)).Msg("cloning finished")
+			}
+
+			worktree, err := r.Worktree()
+			if err != nil {
 				errs <- err
 				return
 			}
 
-			input := make(chan FileState, runtime.NumCPU())
-			go findFiles(filesystem, c, input, errs)
+			for commit := range commits {
+				mut.Lock()
+				// db.CommitsAppender.AppendRow(commit.Hash.String(), commit.Author.Name, commit.Author.When.Format(time.RFC3339), repo)
+				// TODO: This could be sped up by using an appender or csv loader
+				_, err := db.Exec("INSERT INTO commits (hash, contributor, author_date, project) VALUES (?, ?, ?, ?)",
+					commit.Hash.String(),
+					commit.Author.Name,
+					commit.Author.When.Format(time.RFC3339),
+					repo,
+				)
+				mut.Unlock()
 
-			process(db, filesystem, input, errs)
-			commitCompletedCallback(i+1, len(commits))
-		}
-	}()
+				if err != nil && strings.Contains(err.Error(), "Duplicate key") {
+					continue
+				}
+
+				if err != nil {
+					errs <- err
+					return
+				}
+
+				if err := worktree.Checkout(&git.CheckoutOptions{Hash: commit.Hash, Force: true}); err != nil {
+					errs <- err
+					return
+				}
+
+				input := make(chan FileState, runtime.NumCPU())
+				go findFiles(filesystem, commit, input, errs)
+
+				process(db, filesystem, input, errs)
+				commitCompletedCallback(i+1, len(commits))
+			}
+		}()
+	}
 
 	for err := range errs {
 		return err
 	}
+	wg.Wait()
 
-	if err = db.Flush(); err != nil {
+	if err = db.CommitsAppender.Flush(); err != nil {
+		return err
+	}
+
+	if err = db.FilestatesAppender.Flush(); err != nil {
 		return err
 	}
 
@@ -296,7 +332,7 @@ func processFile(db *database.DB, file FileState) error {
 
 	mut.Lock()
 	defer mut.Unlock()
-	if err := db.AppendRow(file.Commit.Hash.String(), file.Location, file.Language, int32(file.Code), int32(file.Comment), int32(file.Blank), int32(file.Complexity), int32(stat.Addition), int32(stat.Deletion)); err != nil {
+	if err := db.FilestatesAppender.AppendRow(file.Commit.Hash.String(), file.Location, file.Language, int32(file.Code), int32(file.Comment), int32(file.Blank), int32(file.Complexity), int32(stat.Addition), int32(stat.Deletion)); err != nil {
 		return err
 	}
 	// PERF: Could improve performance by configuring gc

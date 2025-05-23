@@ -10,7 +10,7 @@
 			"request": "launch",
 			"mode": "auto",
 			"program": "${workspaceFolder}/cmd/cli",
-			"args": ["-f", "go-git/go-billy"]
+			"args": ["-f", "go-git/go-git"]
 		},
 		{
 			"name": "Run Server",

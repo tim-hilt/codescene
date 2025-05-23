@@ -5,16 +5,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime/pprof"
 
 	"github.com/tim-hilt/codescene/internal/database"
 	"github.com/tim-hilt/codescene/internal/server"
 )
 
 func main() {
-	file, _ := os.Create("./cpu.pprof")
-	pprof.StartCPUProfile(file)
-
 	db, err := database.Init()
 	if err != nil {
 		panic(err)
@@ -30,7 +26,6 @@ func main() {
 		if err = db.Close(); err != nil {
 			panic(err)
 		}
-		pprof.StopCPUProfile()
 		os.Exit(0)
 	}()
 
