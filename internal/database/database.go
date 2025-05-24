@@ -17,17 +17,12 @@ var ErrProjectNotFound = errors.New("project not found")
 
 type DB struct {
 	*sql.DB
-	CommitsAppender    *duckdb.Appender
-	FilestatesAppender *duckdb.Appender
+	CommitsAppender *duckdb.Appender
 	driver.Conn
 }
 
 func (db *DB) Close() error {
 	if err := db.CommitsAppender.Close(); err != nil {
-		return err
-	}
-
-	if err := db.FilestatesAppender.Close(); err != nil {
 		return err
 	}
 
@@ -66,7 +61,7 @@ func Init() (*DB, error) {
 					message TEXT NOT NULL,
 				);
 				CREATE TABLE IF NOT EXISTS filestates (
-					commit_hash TEXT NOT NULL,
+					commit_hash TEXT NOT NULL REFERENCES commits(hash),
 					path TEXT NOT NULL,
 					language TEXT NOT NULL,
 					sloc INTEGER NOT NULL,
@@ -86,12 +81,7 @@ func Init() (*DB, error) {
 		return nil, err
 	}
 
-	filestatesAppender, err := duckdb.NewAppenderFromConn(con, "", "filestates")
-	if err != nil {
-		return nil, err
-	}
-
-	return &DB{db, commitsAppender, filestatesAppender, con}, nil
+	return &DB{db, commitsAppender, con}, nil
 }
 
 func (db *DB) Clean(repo string) error {

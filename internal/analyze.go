@@ -62,10 +62,7 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 
 	if force {
 		log.Info().Str("repo", repo).Msg("Force re-analyzing repository, deleting old data")
-
-		if err := db.Clean(repo); err != nil {
-			return err
-		}
+		go db.Clean(repo)
 	}
 
 	// TODO: Find newest commit and clone only from the day of the commit
@@ -146,15 +143,11 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 		return err
 	}
 
-	if err := fw.Import(db); err != nil {
-		return err
-	}
-
 	if err = db.CommitsAppender.Flush(); err != nil {
 		return err
 	}
 
-	if err = db.FilestatesAppender.Flush(); err != nil {
+	if err := fw.Import(db); err != nil {
 		return err
 	}
 
