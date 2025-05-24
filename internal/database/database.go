@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -55,6 +56,7 @@ func Init() (*DB, error) {
 	db := sql.OpenDB(c)
 
 	// TODO: Do I need a primary key for the filestates?
+	// TODO: Do I need the foreign key from filestates to commits?
 	createTablesStmt := `
 				CREATE TABLE IF NOT EXISTS commits (
 					hash TEXT PRIMARY KEY UNIQUE,
@@ -242,6 +244,14 @@ func (db *DB) GetProjectMetadata(project string) (ProjectMetadata, error) {
 		ContributorData: contributorData,
 		CommitFrequency: commitFrequency,
 	}, nil
+}
+
+func (db *DB) ImportCSV(filename string) error {
+	query := fmt.Sprintf("COPY filestates FROM %s", filename)
+	if _, err := db.Exec(query); err != nil {
+		return err
+	}
+	return nil
 }
 
 func countTimestampsOnDay(commitData []CommitData, day time.Time) (int, error) {

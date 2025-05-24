@@ -56,8 +56,8 @@ func (s *Server) analyze(w http.ResponseWriter, r *http.Request) {
 		force = true
 	}
 
-	err := internal.Analyze(s.DB, repo, force, func(c, t int) {
-		w.Write([]byte("id: " + strconv.Itoa(c) + "\n"))
+	err := internal.Analyze(s.DB, repo, force, func(c, t uint64) {
+		w.Write([]byte("id: " + strconv.FormatUint(c, 10) + "\n"))
 		w.Write([]byte(fmt.Sprintf("data: {\"current\":%d,\"total\":%d}\n\n", c, t)))
 		w.(http.Flusher).Flush()
 	})

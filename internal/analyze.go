@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"encoding/csv"
 	"errors"
 	"io"
 	"io/fs"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/boyter/scc/v3/processor"
@@ -28,8 +30,6 @@ type FileState struct {
 	*processor.FileJob
 	Stats *FileChange
 }
-
-var mut sync.Mutex
 
 func sanitizeRepo(repo string) (string, error) {
 	u, err := url.Parse(repo)
@@ -53,7 +53,7 @@ func sanitizeRepo(repo string) (string, error) {
 	return repo, nil
 }
 
-func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback func(curr, total int)) error {
+func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback func(curr, total uint64)) error {
 
 	repo, err := sanitizeRepo(repo)
 	if err != nil {
@@ -68,19 +68,21 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 		}
 	}
 
-	tmp, err := os.MkdirTemp("", "")
+	// TODO: Find newest commit and clone only from the day of the commit
+
+	repoPath, err := os.MkdirTemp("", "")
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmp)
+	defer os.RemoveAll(repoPath)
 	start := time.Now()
-	err = gitClone("https://"+repo, tmp)
+	err = gitClone("https://"+repo, repoPath)
 	if err != nil {
 		return err
 	}
 	log.Info().Dur("duration", time.Since(start)).Msg("cloning finished")
 
-	commits, err := gitLog(tmp)
+	commits, err := gitLog(repoPath)
 	if err != nil {
 		return err
 	}
@@ -90,18 +92,25 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 
 	processor.ProcessConstants()
 
+	fw, err := NewFilestatesWriter()
+	if err != nil {
+		return err
+	}
+	defer fw.Close()
+
 	go func() {
 		defer close(errs)
-		for i, commit := range commits {
-			mut.Lock()
+		var i atomic.Uint64
+
+		for _, commit := range commits {
 			date, err := time.Parse(time.RFC3339, commit.Date)
 			if err != nil {
 				errs <- err
 				return
 			}
 
+			// TODO: Append new commits upfront, so that Analyze can be run repeatedly
 			err = db.CommitsAppender.AppendRow(commit.Hash, commit.Author, date, repo, commit.Message)
-			mut.Unlock()
 
 			if err != nil && strings.Contains(err.Error(), "Duplicate key") {
 				continue
@@ -112,25 +121,32 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 				return
 			}
 
-			if len(commit.FileChanges) == 0 {
-				// Don't record, if no change
-				continue
-			}
-
-			err = gitCheckout(tmp, commit.Hash)
+			err = gitCheckout(repoPath, commit.Hash)
 			if err != nil {
 				errs <- err
 				return
 			}
 
 			input := make(chan FileState, runtime.NumCPU())
-			go findFiles(tmp, commit, input, errs)
-			process(db, input, errs)
-			commitCompletedCallback(i+1, len(commits))
+			removedFiles := make(chan string)
+			changedFiles := make(chan FileState, runtime.NumCPU())
+
+			go findFiles(repoPath, commit, input, removedFiles, errs)
+			go process(input, changedFiles, errs)
+			if err := fw.Collect(commit.Hash, changedFiles, removedFiles); err != nil {
+				errs <- err
+				return
+			}
+
+			commitCompletedCallback(i.Add(1), uint64(len(commits)))
 		}
 	}()
 
 	for err := range errs {
+		return err
+	}
+
+	if err := fw.Import(db); err != nil {
 		return err
 	}
 
@@ -145,8 +161,122 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 	return nil
 }
 
-func findFiles(repoPath string, commit Commit, files chan FileState, errs chan error) {
-	defer close(files)
+type FilestatesWriter struct {
+	*csv.Writer
+	file     *os.File
+	previous [][]string
+}
+
+func NewFilestatesWriter() (*FilestatesWriter, error) {
+	file, err := os.Create("filestates.csv")
+	if err != nil {
+		return nil, err
+	}
+	writer := csv.NewWriter(file)
+
+	fw := &FilestatesWriter{writer, file, [][]string{}}
+
+	if err := fw.Write([]string{"commit_hash", "path", "language", "sloc", "cloc", "blank", "complexity", "lines_added", "lines_deleted"}); err != nil {
+		return nil, err
+	}
+
+	return fw, nil
+}
+
+func (fw *FilestatesWriter) Collect(hash string, changedFiles chan FileState, removedFiles chan string) error {
+	var (
+		rfs []string
+		cfs []FileState
+	)
+
+	for {
+		var changedFilesClosed, removedFilesClosed bool
+		for !changedFilesClosed || !removedFilesClosed {
+			select {
+			case val, ok := <-changedFiles:
+				if !ok {
+					changedFilesClosed = true
+					changedFiles = nil // disable this case
+					continue
+				}
+				cfs = append(cfs, val)
+			case val, ok := <-removedFiles:
+				if !ok {
+					removedFilesClosed = true
+					removedFiles = nil // disable this case
+					continue
+				}
+				rfs = append(rfs, val)
+			}
+		}
+		break
+	}
+
+	var current [][]string
+
+	for _, row := range fw.previous {
+		for _, cf := range cfs {
+			if cf.Filename == row[1] {
+				// If file is changed in commit
+				continue
+			}
+
+			if cf.Stats.RenameFrom == row[1] {
+				// If changed file was renamed from previously registered state
+				continue
+			}
+		}
+
+		for _, rf := range rfs {
+			if rf == row[1] {
+				// If file was removed in commit
+				continue
+			}
+		}
+
+		row[0] = hash
+		current = append(current, row)
+	}
+
+	for _, cf := range cfs {
+		current = append(current, []string{
+			cf.Commit.Hash,
+			cf.Filename,
+			cf.Language,
+			strconv.FormatInt(cf.Code, 10),
+			strconv.FormatInt(cf.Comment, 10),
+			strconv.FormatInt(cf.Blank, 10),
+			strconv.FormatInt(cf.Complexity, 10),
+			strconv.FormatInt(cf.Stats.LinesAdded, 10),
+			strconv.FormatInt(cf.Stats.LinesRemoved, 10),
+		})
+	}
+
+	if err := fw.WriteAll(current); err != nil {
+		return err
+	}
+
+	fw.previous = current
+
+	return nil
+}
+
+func (fw *FilestatesWriter) Import(db *database.DB) error {
+	fw.Flush()
+	if err := db.ImportCSV(fw.file.Name()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (fw *FilestatesWriter) Close() {
+	fw.file.Close()
+	os.Remove(fw.file.Name())
+}
+
+func findFiles(repoPath string, commit Commit, input chan FileState, removedFiles chan string, errs chan error) {
+	defer close(input)
+	defer close(removedFiles)
 
 	for _, fileChange := range commit.FileChanges {
 		path := filepath.Join(repoPath, fileChange.Path)
@@ -154,7 +284,7 @@ func findFiles(repoPath string, commit Commit, files chan FileState, errs chan e
 
 		if err != nil && strings.Contains(err.Error(), "no such file") && fileChange.LinesRemoved > 0 {
 			// File was removed in this commit
-			// TODO: Handle correctly!
+			removedFiles <- path
 			continue
 		}
 
@@ -162,11 +292,11 @@ func findFiles(repoPath string, commit Commit, files chan FileState, errs chan e
 			errs <- err
 			return
 		}
-		f := newFileJob(path, info)
+		f := newFileJob(repoPath, path, info)
 		if f == nil {
 			continue
 		}
-		files <- FileState{
+		input <- FileState{
 			Commit:  commit,
 			FileJob: f,
 			Stats:   &fileChange,
@@ -176,7 +306,7 @@ func findFiles(repoPath string, commit Commit, files chan FileState, errs chan e
 
 var LargeByteCount int64 = 1000000
 
-func newFileJob(path string, info fs.FileInfo) *processor.FileJob {
+func newFileJob(repoPath, path string, info fs.FileInfo) *processor.FileJob {
 	if info.Size() >= LargeByteCount {
 		return nil
 	}
@@ -204,7 +334,7 @@ func newFileJob(path string, info fs.FileInfo) *processor.FileJob {
 
 		return &processor.FileJob{
 			Location:          path,
-			Filename:          path,
+			Filename:          strings.TrimPrefix(path, repoPath+"/"),
 			Extension:         extension,
 			PossibleLanguages: language,
 			Bytes:             info.Size(),
@@ -215,7 +345,8 @@ func newFileJob(path string, info fs.FileInfo) *processor.FileJob {
 	return nil
 }
 
-func process(db *database.DB, input chan FileState, errs chan error) {
+func process(input, changedFiles chan FileState, errs chan error) {
+	defer close(changedFiles)
 	var wg sync.WaitGroup
 
 	for i := 0; i < runtime.NumCPU(); i++ {
@@ -229,7 +360,7 @@ func process(db *database.DB, input chan FileState, errs chan error) {
 					return
 				}
 				copy(file.Content, content)
-				if err = processFile(db, file); err != nil && err.Error() != "Missing #!" {
+				if err = processFile(file, changedFiles); err != nil && err.Error() != "Missing #!" {
 					errs <- err
 					return
 				}
@@ -240,7 +371,7 @@ func process(db *database.DB, input chan FileState, errs chan error) {
 	wg.Wait()
 }
 
-func processFile(db *database.DB, file FileState) error {
+func processFile(file FileState, changedFiles chan FileState) error {
 	file.Language = processor.DetermineLanguage(file.Filename, file.Language, file.PossibleLanguages, file.Content)
 	if file.Language == processor.SheBang {
 
@@ -266,22 +397,7 @@ func processFile(db *database.DB, file FileState) error {
 		// Stop analysis, but not an error
 		return nil
 	}
-
-	mut.Lock()
-	defer mut.Unlock()
-	if err := db.FilestatesAppender.AppendRow(
-		file.Commit.Hash,
-		file.Location,
-		file.Language,
-		int32(file.Code),
-		int32(file.Comment),
-		int32(file.Blank),
-		int32(file.Complexity),
-		int32(file.Stats.LinesAdded),
-		int32(file.Stats.LinesRemoved),
-	); err != nil {
-		return err
-	}
+	changedFiles <- file
 	// PERF: Could improve performance by passing around more pointers instead of values, esp. for FileState
 	return nil
 }
@@ -337,6 +453,7 @@ func gitLog(repo string) ([]Commit, error) {
 }
 
 func parseCommit(commitString string) (Commit, error) {
+	commitString = strings.TrimSpace(commitString)
 	lines := strings.Split(commitString, "\n")
 
 	commitData := strings.Split(strings.Trim(lines[0], "'"), ";")
