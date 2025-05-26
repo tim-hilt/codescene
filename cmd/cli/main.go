@@ -2,8 +2,6 @@ package main
 
 import (
 	"flag"
-	"os"
-	"runtime/trace"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -19,15 +17,11 @@ func parseFlags() ([]string, bool) {
 	return repos, *force
 }
 
-func commitCompletedCallback(curr, total uint64) {
-	log.Info().Uint64("current", curr).Uint64("total", total).Msg("Processed commits")
+func commitCompletedCallback(curr, total int) {
+	log.Info().Int("current", curr).Int("total", total).Msg("Processed commits")
 }
 
 func main() {
-	f, _ := os.Create("trace.out")
-	trace.Start(f)
-	defer trace.Stop()
-
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	repos, force := parseFlags()
 	if len(repos) == 0 {

@@ -9,24 +9,41 @@ import (
 	"slices"
 	"time"
 
+	"github.com/boyter/scc/v3/processor"
 	"github.com/marcboeker/go-duckdb/v2"
 )
 
 var ErrProjectNotFound = errors.New("project not found")
 
+type FileState struct {
+	CommitHash   string
+	RenameFrom   string
+	LinesAdded   int64
+	LinesDeleted int64
+	*processor.FileJob
+}
+
+type Commit struct {
+	Hash    string
+	Author  string
+	Message string
+	Date    string
+	Project string
+}
+
 type DB struct {
 	*sql.DB
-	FilestatesAppender *duckdb.Appender
-	CommitsAppender    *duckdb.Appender
+	filestatesAppender *duckdb.Appender
+	commitsAppender    *duckdb.Appender
 	driver.Conn
 }
 
 func (db *DB) Close() error {
-	if err := db.CommitsAppender.Close(); err != nil {
+	if err := db.commitsAppender.Close(); err != nil {
 		return err
 	}
 
-	if err := db.FilestatesAppender.Close(); err != nil {
+	if err := db.filestatesAppender.Close(); err != nil {
 		return err
 	}
 
@@ -139,6 +156,18 @@ func (db *DB) GetProjects() ([]string, error) {
 	return projects, nil
 }
 
+func (db *DB) GetNewestCommitDate(repo string) (time.Time, error) {
+	var authorDate time.Time
+	err := db.QueryRow("SELECT author_date FROM commits WHERE project = ? ORDER BY author_date DESC LIMIT 1", repo).Scan(&authorDate)
+
+	if err != nil && err != sql.ErrNoRows {
+		// If no rows are in the result-set, then the project hasn't been analyzed yet
+		return authorDate, err
+	}
+
+	return authorDate, nil
+}
+
 type CommitData struct {
 	CommitDate string `json:"commitDate"`
 	Sloc       int    `json:"sloc"`
@@ -246,18 +275,57 @@ func (db *DB) GetProjectMetadata(project string) (ProjectMetadata, error) {
 	}, nil
 }
 
-func countTimestampsOnDay(commitData []CommitData, day time.Time) (int, error) {
-	day = day.Truncate(24 * time.Hour)
-	count := 0
-
-	for _, cd := range commitData {
-		t, err := time.Parse(time.RFC3339, cd.CommitDate)
+func (db *DB) PersistCommits(commits chan Commit, errs chan error) {
+	for commit := range commits {
+		date, err := time.Parse(time.RFC3339, commit.Date)
 		if err != nil {
-			return -1, err
+			errs <- err
+			return
 		}
-		if t.Truncate(24 * time.Hour).Equal(day) {
-			count++
+		if err = db.commitsAppender.AppendRow(commit.Hash, commit.Author, date, commit.Project, commit.Message); err != nil {
+			errs <- err
+			return
 		}
 	}
-	return count, nil
+
+	if err := db.commitsAppender.Flush(); err != nil {
+		errs <- err
+		return
+	}
+}
+
+func (db *DB) PersistFileStates(filestates chan FileState, numFilestates int, filestateProcessedCallback func(curr, total int), errs chan error) {
+	var (
+		err error
+		i   int
+	)
+
+	for filestate := range filestates {
+		err = db.filestatesAppender.AppendRow(
+			filestate.CommitHash,
+			filestate.Filename,
+			filestate.RenameFrom,
+			filestate.Language,
+			int32(filestate.LinesAdded),
+			int32(filestate.LinesDeleted),
+			int32(filestate.Code),
+			int32(filestate.Comment),
+			int32(filestate.Blank),
+			int32(filestate.Complexity),
+		)
+		if err != nil {
+			errs <- err
+			return
+		}
+		i++
+		filestateProcessedCallback(i, numFilestates)
+	}
+}
+
+func (db *DB) Flush() error {
+	if err := db.filestatesAppender.Flush(); err != nil {
+		return err
+	}
+
+	return nil
 }
