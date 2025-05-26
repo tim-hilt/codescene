@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
-	"fmt"
 	"slices"
 	"time"
 
@@ -17,12 +16,17 @@ var ErrProjectNotFound = errors.New("project not found")
 
 type DB struct {
 	*sql.DB
-	CommitsAppender *duckdb.Appender
+	FilestatesAppender *duckdb.Appender
+	CommitsAppender    *duckdb.Appender
 	driver.Conn
 }
 
 func (db *DB) Close() error {
 	if err := db.CommitsAppender.Close(); err != nil {
+		return err
+	}
+
+	if err := db.FilestatesAppender.Close(); err != nil {
 		return err
 	}
 
@@ -77,12 +81,17 @@ func Init() (*DB, error) {
 		return nil, err
 	}
 
+	filestatesAppender, err := duckdb.NewAppenderFromConn(con, "", "filestates")
+	if err != nil {
+		return nil, err
+	}
+
 	commitsAppender, err := duckdb.NewAppenderFromConn(con, "", "commits")
 	if err != nil {
 		return nil, err
 	}
 
-	return &DB{db, commitsAppender, con}, nil
+	return &DB{db, filestatesAppender, commitsAppender, con}, nil
 }
 
 func (db *DB) Clean(repo string) error {
@@ -235,14 +244,6 @@ func (db *DB) GetProjectMetadata(project string) (ProjectMetadata, error) {
 		ContributorData: contributorData,
 		CommitFrequency: commitFrequency,
 	}, nil
-}
-
-func (db *DB) ImportCSV(filename string) error {
-	query := fmt.Sprintf("COPY filestates FROM %s", filename)
-	if _, err := db.Exec(query); err != nil {
-		return err
-	}
-	return nil
 }
 
 func countTimestampsOnDay(commitData []CommitData, day time.Time) (int, error) {

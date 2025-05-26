@@ -1,7 +1,6 @@
 package internal
 
 import (
-	"encoding/csv"
 	"errors"
 	"fmt"
 	"net/url"
@@ -20,16 +19,12 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	// TODO: Try to get arrow support working
 	"github.com/tim-hilt/codescene/internal/database"
 )
 
 /**
- * 2. Rewrite gitLog, so that it returns a []FileState -> Which is the type, that will be persisted -> Requires rewriting FileState type
- * 3. Reduce nested goroutines - have one fan-out call and bump concurrency up if needed
  * 4. Introduce git submodule
  * 5. Find out what is causing the amount of duplicate data (should be around 850.000 rows, not 10.9M rows)
- * 6. Find out why progress is blocked
  */
 
 type FileState struct {
@@ -118,30 +113,11 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 		}
 	}
 
+	if err = db.CommitsAppender.Flush(); err != nil {
+		return err
+	}
+
 	processor.ProcessConstants()
-
-	file, err := os.Create("filestates.csv")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
-
-	writer := csv.NewWriter(file)
-
-	if err := writer.Write([]string{
-		"commit_hash",
-		"path",
-		"rename_from",
-		"language",
-		"sloc",
-		"cloc",
-		"blank",
-		"complexity",
-		"lines_added",
-		"lines_deleted",
-	}); err != nil {
-		return err
-	}
 
 	// TODO: Remove casting as much as possible
 
@@ -160,20 +136,19 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 	var current atomic.Int32
 
 	for filestate := range processFilestates(repoPath, input, errs) {
-		// TODO: Check how much slower an appender would be here
-		writer.Write([]string{
+		db.FilestatesAppender.AppendRow(
 			filestate.commitHash,
 			filestate.path,
 			filestate.renameFrom,
 			filestate.language,
-			strconv.FormatInt(filestate.linesAdded, 10),
-			strconv.FormatInt(filestate.linesDeleted, 10),
-			strconv.FormatInt(filestate.sloc, 10),
-			strconv.FormatInt(filestate.cloc, 10),
-			strconv.FormatInt(filestate.blank, 10),
-			strconv.FormatInt(filestate.complexity, 10),
-		})
-		log.Info().Int32("current", current.Add(1)+1).Int("total", len(filestates)).Msg("processed filestate")
+			int32(filestate.linesAdded),
+			int32(filestate.linesDeleted),
+			int32(filestate.sloc),
+			int32(filestate.cloc),
+			int32(filestate.blank),
+			int32(filestate.complexity),
+		)
+		log.Info().Int32("current", current.Add(1)).Int("total", len(filestates)).Msg("processed filestate")
 	}
 
 	// for err := range errs {
@@ -182,14 +157,8 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 	// 	}
 	// }
 
-	if err = db.CommitsAppender.Flush(); err != nil {
-		return err
-	}
-
-	writer.Flush()
 	// TODO: Fill missing filestates -> Claude
-
-	if err := db.ImportCSV(file.Name()); err != nil {
+	if err = db.FilestatesAppender.Flush(); err != nil {
 		return err
 	}
 
