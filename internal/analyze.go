@@ -9,9 +9,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/boyter/scc/v3/processor"
@@ -141,36 +143,24 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 		return err
 	}
 
-	for i, filestate := range filestates {
-		path := filepath.Join(repoPath, filestate.path)
-		content, err := gitShow(repoPath, filestate.commitHash, filestate.path)
+	// TODO: Remove casting as much as possible
 
-		if err == os.ErrNotExist {
-			continue
+	input := make(chan FileState, runtime.NumCPU())
+
+	go func() {
+		defer close(input)
+
+		// TODO: Instead of pushing filestates in the channel, I could also return a channel from gitLog. Same for commits
+		for i := range filestates {
+			input <- filestates[i]
 		}
+	}()
 
-		if err != nil {
-			return err
-		}
+	errs := make(chan error)
+	var current atomic.Int32
 
-		// TODO: I'm pretty sure, not all needed properties of FileJob are set here
-		f := newFileJob(repoPath, path, content)
-		if f == nil {
-			continue
-		}
-
-		if err := processFile(f); err != nil && err.Error() != "Missing #!" {
-			return err
-		}
-
-		filestate.language = f.Language
-		filestate.sloc = f.Code
-		filestate.cloc = f.Comment
-		filestate.blank = f.Blank
-		filestate.complexity = f.Complexity
-
+	for filestate := range processFilestates(repoPath, input, errs) {
 		// TODO: Check how much slower an appender would be here
-		mut.Lock()
 		writer.Write([]string{
 			filestate.commitHash,
 			filestate.path,
@@ -183,10 +173,14 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 			strconv.FormatInt(filestate.blank, 10),
 			strconv.FormatInt(filestate.complexity, 10),
 		})
-		mut.Unlock()
-
-		commitCompletedCallback(uint64(i), uint64(len(filestates)))
+		log.Info().Int32("current", current.Add(1)+1).Int("total", len(filestates)).Msg("processed filestate")
 	}
+
+	// for err := range errs {
+	// 	if err != nil {
+	// 		return err
+	// 	}
+	// }
 
 	if err = db.CommitsAppender.Flush(); err != nil {
 		return err
@@ -203,9 +197,63 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 }
 
 var (
-	mut            sync.Mutex
 	LargeByteCount int = 1000000
 )
+
+func processFilestates(repoPath string, input chan FileState, errs chan error) chan FileState {
+	output := make(chan FileState)
+
+	go func() {
+		defer close(errs)
+		defer close(output)
+		var wg sync.WaitGroup
+
+		for i := 0; i < runtime.NumCPU(); i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				for filestate := range input {
+					path := filepath.Join(repoPath, filestate.path)
+					content, err := gitShow(repoPath, filestate.commitHash, filestate.path)
+
+					if err == os.ErrNotExist {
+						continue
+					}
+
+					if err != nil {
+						errs <- err
+						return
+					}
+
+					// TODO: I'm pretty sure, not all needed properties of FileJob are set here
+					f := newFileJob(repoPath, path, content)
+					if f == nil {
+						continue
+					}
+
+					if err := processFile(f); err != nil && err.Error() != "Missing #!" {
+						errs <- err
+						return
+					}
+
+					// TODO: Get rid of using FileJob. One type shall suffice
+					filestate.language = f.Language
+					filestate.sloc = f.Code
+					filestate.cloc = f.Comment
+					filestate.blank = f.Blank
+					filestate.complexity = f.Complexity
+
+					output <- filestate
+				}
+			}()
+		}
+
+		wg.Wait()
+	}()
+
+	return output
+}
 
 func newFileJob(repoPath, path string, content []byte) *processor.FileJob {
 	if len(content) >= LargeByteCount {
