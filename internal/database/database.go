@@ -63,6 +63,7 @@ func Init() (*DB, error) {
 				CREATE TABLE IF NOT EXISTS filestates (
 					commit_hash TEXT NOT NULL REFERENCES commits(hash),
 					path TEXT NOT NULL,
+					rename_from TEXT,
 					language TEXT NOT NULL,
 					sloc INTEGER NOT NULL,
 					cloc INTEGER NOT NULL,
