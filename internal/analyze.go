@@ -3,8 +3,7 @@ package internal
 import (
 	"encoding/csv"
 	"errors"
-	"io"
-	"io/fs"
+	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
@@ -25,11 +24,23 @@ import (
 	"github.com/tim-hilt/codescene/internal/database"
 )
 
+/**
+ * 2. Rewrite gitLog, so that it returns a []FileState -> Which is the type, that will be persisted -> Requires rewriting FileState type
+ * 3. Reduce nested goroutines - have one fan-out call and bump concurrency up if needed
+ * 4. Introduce git submodule
+ * 5. Find out what is causing the amount of duplicate data (should be around 850.000 rows, not 10.9M rows)
+ * 6. Find out why progress is blocked
+ */
+
 type FileState struct {
 	Commit
 	*processor.FileJob
 	Stats *FileChange
 }
+
+var (
+	ErrRepoFormat = errors.New("provide repo in the format <user>/<repo>")
+)
 
 func sanitizeRepo(repo string) (string, error) {
 	u, err := url.Parse(repo)
@@ -45,7 +56,7 @@ func sanitizeRepo(repo string) (string, error) {
 	u.Path = strings.TrimSuffix(strings.TrimPrefix(u.Path, "/"), "/")
 
 	if len(strings.Split(u.Path, "/")) != 2 {
-		return "", errors.New("provide repo in the format <user>/<repo>")
+		return "", ErrRepoFormat
 	}
 
 	repo = u.Host + "/" + u.Path
@@ -106,19 +117,12 @@ func Analyze(db *database.DB, repo string, force bool, commitCompletedCallback f
 				return
 			}
 
-			// TODO: Append new commits upfront, so that Analyze can be run repeatedly
 			err = db.CommitsAppender.AppendRow(commit.Hash, commit.Author, date, repo, commit.Message)
 
 			if err != nil && strings.Contains(err.Error(), "Duplicate key") {
 				continue
 			}
 
-			if err != nil {
-				errs <- err
-				return
-			}
-
-			err = gitCheckout(repoPath, commit.Hash)
 			if err != nil {
 				errs <- err
 				return
@@ -273,10 +277,10 @@ func findFiles(repoPath string, commit Commit, input chan FileState, removedFile
 
 	for _, fileChange := range commit.FileChanges {
 		path := filepath.Join(repoPath, fileChange.Path)
-		info, err := os.Lstat(path)
 
-		if err != nil && strings.Contains(err.Error(), "no such file") && fileChange.LinesRemoved > 0 {
-			// File was removed in this commit
+		content, err := gitShow(repoPath, commit.Hash, fileChange.Path)
+
+		if err == os.ErrNotExist {
 			removedFiles <- path
 			continue
 		}
@@ -285,7 +289,8 @@ func findFiles(repoPath string, commit Commit, input chan FileState, removedFile
 			errs <- err
 			return
 		}
-		f := newFileJob(repoPath, path, info)
+
+		f := newFileJob(repoPath, path, content)
 		if f == nil {
 			continue
 		}
@@ -297,18 +302,10 @@ func findFiles(repoPath string, commit Commit, input chan FileState, removedFile
 	}
 }
 
-var LargeByteCount int64 = 1000000
+var LargeByteCount int = 1000000
 
-func newFileJob(repoPath, path string, info fs.FileInfo) *processor.FileJob {
-	if info.Size() >= LargeByteCount {
-		return nil
-	}
-
-	if info.Mode()&os.ModeSymlink == os.ModeSymlink {
-		return nil
-	}
-
-	if !info.Mode().IsRegular() {
+func newFileJob(repoPath, path string, content []byte) *processor.FileJob {
+	if len(content) >= LargeByteCount {
 		return nil
 	}
 
@@ -330,8 +327,8 @@ func newFileJob(repoPath, path string, info fs.FileInfo) *processor.FileJob {
 			Filename:          strings.TrimPrefix(path, repoPath+"/"),
 			Extension:         extension,
 			PossibleLanguages: language,
-			Bytes:             info.Size(),
-			Content:           make([]byte, info.Size()),
+			Bytes:             int64(len(content)),
+			Content:           content,
 		}
 	}
 
@@ -347,13 +344,7 @@ func process(input, changedFiles chan FileState, errs chan error) {
 		go func() {
 			defer wg.Done()
 			for file := range input {
-				content, err := os.ReadFile(file.Location)
-				if err != nil && err != io.EOF {
-					errs <- err
-					return
-				}
-				copy(file.Content, content)
-				if err = processFile(file, changedFiles); err != nil && err.Error() != "Missing #!" {
+				if err := processFile(file, changedFiles); err != nil && err.Error() != "Missing #!" {
 					errs <- err
 					return
 				}
@@ -508,8 +499,15 @@ func getRenamedPaths(path string) (string, string) {
 	return path, path
 }
 
-func gitCheckout(repo, hash string) error {
-	cmd := exec.Command("git", "checkout", "-f", hash)
+func gitShow(repo, hash, file string) ([]byte, error) {
+	cmd := exec.Command("git", "show", fmt.Sprintf("%s:%s", hash, file))
 	cmd.Dir = repo
-	return cmd.Run()
+
+	stdout, err := cmd.Output()
+
+	if err != nil {
+		return nil, os.ErrNotExist
+	}
+
+	return stdout, nil
 }
