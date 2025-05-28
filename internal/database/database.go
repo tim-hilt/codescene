@@ -72,10 +72,11 @@ func Init() (*DB, error) {
 	db := sql.OpenDB(c)
 
 	// TODO: Do I need a primary key for the filestates?
-	// TODO: Do I need the foreign key from filestates to commits?
 	createTablesStmt := `
+	            CREATE SEQUENCE id_sequence START 1;
 				CREATE TABLE IF NOT EXISTS commits (
-					hash TEXT PRIMARY KEY UNIQUE,
+					id INTEGER PRIMARY KEY DEFAULT nextval('id_sequence'),
+					hash TEXT UNIQUE,
 					contributor TEXT NOT NULL,
 					author_date TIMESTAMP_S NOT NULL,
 					project TEXT NOT NULL,
@@ -133,7 +134,7 @@ func (db *DB) Clean(repo string) error {
 	return nil
 }
 
-func (db *DB) GetProjects() ([]string, error) {
+func (db DB) GetProjects() ([]string, error) {
 	rows, err := db.Query("SELECT DISTINCT project FROM commits")
 	if err != nil {
 		return nil, err
@@ -156,7 +157,7 @@ func (db *DB) GetProjects() ([]string, error) {
 	return projects, nil
 }
 
-func (db *DB) GetNewestCommitDate(repo string) (time.Time, error) {
+func (db DB) GetNewestCommitDate(repo string) (time.Time, error) {
 	var authorDate time.Time
 	err := db.QueryRow("SELECT author_date FROM commits WHERE project = ? ORDER BY author_date DESC LIMIT 1", repo).Scan(&authorDate)
 
@@ -190,7 +191,7 @@ type ProjectMetadata struct {
 	CommitFrequency []CommitFrequency `json:"commitFrequency"`
 }
 
-func (db *DB) GetProjectMetadata(project string) (ProjectMetadata, error) {
+func (db DB) GetProjectMetadata(project string) (ProjectMetadata, error) {
 	rows, err := db.Query(`
 	SELECT 
 		c.author_date,
@@ -328,4 +329,120 @@ func (db *DB) Flush() error {
 	}
 
 	return nil
+}
+func (db *DB) FillFilestates(repo string, removedFiles map[string][]string) error {
+	hashes, err := db.getCommitHashes(repo)
+	if err != nil {
+		return err
+	}
+
+	var filestatesLastCommit []FileState
+	for _, hash := range hashes {
+		filestatesCurrentCommit, err := db.getFilestatesWithHash(hash)
+		if err != nil {
+			return err
+		}
+
+		var relevantFilestatesLastCommit []FileState
+
+	ProcessFilestatesLastCommit:
+		for _, filestateLastCommit := range filestatesLastCommit {
+			// If f is removed in this commit, continue
+			if rfs, exist := removedFiles[hash]; exist {
+				for _, rf := range rfs {
+					if rf == filestateLastCommit.Filename {
+						continue ProcessFilestatesLastCommit
+					}
+				}
+			}
+			// If f is (renamed) in filestates, continue
+			for _, filestateCurrentCommit := range filestatesCurrentCommit {
+				if filestateCurrentCommit.Filename == filestateLastCommit.Filename || filestateCurrentCommit.RenameFrom == filestateLastCommit.Filename {
+					continue ProcessFilestatesLastCommit
+				}
+			}
+
+			if err := db.filestatesAppender.AppendRow(
+				hash,
+				filestateLastCommit.Filename,
+				filestateLastCommit.RenameFrom,
+				filestateLastCommit.Language,
+				int32(filestateLastCommit.LinesAdded),
+				int32(filestateLastCommit.LinesDeleted),
+				int32(filestateLastCommit.Code),
+				int32(filestateLastCommit.Comment),
+				int32(filestateLastCommit.Blank),
+				int32(filestateLastCommit.Complexity),
+			); err != nil {
+				return err
+			}
+
+			relevantFilestatesLastCommit = append(relevantFilestatesLastCommit, filestateLastCommit)
+		}
+
+		filestatesLastCommit = append(filestatesCurrentCommit, relevantFilestatesLastCommit...)
+	}
+
+	return db.Flush()
+}
+
+func (db DB) getCommitHashes(repo string) ([]string, error) {
+	query := "SELECT hash from commits WHERE project = ? ORDER BY id"
+	rows, err := db.Query(query, repo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var hashes []string
+	for rows.Next() {
+		var hash string
+		if err := rows.Scan(&hash); err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, hash)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return hashes, nil
+}
+
+func (db DB) getFilestatesWithHash(hash string) ([]FileState, error) {
+	query := "SELECT * from filestates WHERE commit_hash = ?"
+	rows, err := db.Query(query, hash)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var filestates []FileState
+	for rows.Next() {
+		f := FileState{
+			FileJob: &processor.FileJob{},
+		}
+		if err := rows.Scan(
+			&f.CommitHash,
+			&f.Filename,
+			&f.RenameFrom,
+			&f.Language,
+			&f.Code,
+			&f.Comment,
+			&f.Blank,
+			&f.Complexity,
+			&f.LinesAdded,
+			&f.LinesDeleted,
+		); err != nil {
+			return nil, err
+		}
+		filestates = append(filestates, f)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return filestates, nil
 }

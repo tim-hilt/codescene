@@ -24,8 +24,13 @@ type Repository struct {
 	repo string
 }
 
-func Clone(repo, destination string, shallowSince time.Time) (Repository, error) {
+func Clone(repo string, shallowSince time.Time) (Repository, error) {
 	shallowSince = shallowSince.Add(1 * time.Second)
+
+	destination, err := os.MkdirTemp("", "")
+	if err != nil {
+		return Repository{}, err
+	}
 
 	cmd := exec.Command(
 		"git",
@@ -34,14 +39,14 @@ func Clone(repo, destination string, shallowSince time.Time) (Repository, error)
 		"--no-tags",
 		"--no-checkout",
 		"--shallow-since="+shallowSince.Format(time.RFC3339),
-		repo,
+		"https://"+repo,
 		destination,
 	)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
 
 	if strings.Contains(stderr.String(), "error processing shallow info: 4") {
 		return Repository{}, ErrNoNewCommits
@@ -76,10 +81,10 @@ func (r Repository) Log() (chan database.Commit, int, chan database.FileState, i
 
 	for i, commitString := range commitStrings {
 		commit, fs, err := parseCommit(commitString)
-		commit.Project = r.repo
 		if err != nil {
 			return nil, -1, nil, -1, err
 		}
+		commit.Project = r.repo
 		commits[i] = commit
 		filestates = append(filestates, fs...)
 	}
@@ -108,12 +113,26 @@ func (r Repository) Show(hash, file string) ([]byte, error) {
 	cmd := exec.Command("git", "show", fmt.Sprintf("%s:%s", hash, file))
 	cmd.Dir = r.Path
 
-	stdout, err := cmd.Output()
+	var (
+		stderr bytes.Buffer
+		stdout bytes.Buffer
+	)
 
-	if err != nil {
-		// TODO: Infer correct error based off of stderr
+	cmd.Stderr = &stderr
+	cmd.Stdout = &stdout
+	err := cmd.Run()
+
+	if strings.Contains(stderr.String(), "does not exist") {
 		return nil, os.ErrNotExist
 	}
 
-	return stdout, nil
+	if err != nil {
+		return nil, err
+	}
+
+	return stdout.Bytes(), nil
+}
+
+func (r Repository) Close() error {
+	return os.RemoveAll(r.Path)
 }

@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/boyter/scc/v3/processor"
 
@@ -65,13 +64,7 @@ func Analyze(db *database.DB, repo string, force bool, filestateProcessedCallbac
 		return err
 	}
 
-	repoPath, err := os.MkdirTemp("", "")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(repoPath)
-	start := time.Now()
-	repository, err := git.Clone("https://"+repo, repoPath, newestCommitAt)
+	repository, err := git.Clone(repo, newestCommitAt)
 
 	if err == git.ErrNoNewCommits {
 		log.Info().Str("repository", repo).Msg("no new commits")
@@ -81,7 +74,7 @@ func Analyze(db *database.DB, repo string, force bool, filestateProcessedCallbac
 	if err != nil {
 		return err
 	}
-	log.Info().Dur("duration", time.Since(start)).Str("repository", repo).Msg("cloning finished")
+	defer repository.Close()
 
 	commits, numCommits, filestates, numFilestates, err := repository.Log()
 	if err != nil {
@@ -96,11 +89,9 @@ func Analyze(db *database.DB, repo string, force bool, filestateProcessedCallbac
 
 	processor.ProcessConstants()
 
-	output := processFilestates(repository, filestates, errs)
+	removedFiles := make(map[string][]string)
+	output := processFilestates(repository, filestates, &removedFiles, errs)
 	go db.PersistFileStates(output, numFilestates, filestateProcessedCallback, errs)
-
-	go func() {
-	}()
 
 	for err := range errs {
 		if err != nil {
@@ -108,21 +99,27 @@ func Analyze(db *database.DB, repo string, force bool, filestateProcessedCallbac
 		}
 	}
 
-	// TODO: Fill missing filestates -> Claude
 	if err := db.Flush(); err != nil {
+		return err
+	}
+
+	if err := db.FillFilestates(repo, removedFiles); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func processFilestates(repository git.Repository, input chan database.FileState, errs chan error) chan database.FileState {
+func processFilestates(repository git.Repository, input chan database.FileState, removedFiles *map[string][]string, errs chan error) chan database.FileState {
 	output := make(chan database.FileState)
 
 	go func() {
 		defer close(errs)
 		defer close(output)
-		var wg sync.WaitGroup
+		var (
+			wg  sync.WaitGroup
+			mut sync.Mutex
+		)
 
 		for i := 0; i < Concurrency; i++ {
 			wg.Add(1)
@@ -134,7 +131,12 @@ func processFilestates(repository git.Repository, input chan database.FileState,
 					content, err := repository.Show(filestate.CommitHash, filestate.Filename)
 
 					if err == os.ErrNotExist {
-						// file removed in this commit
+						mut.Lock()
+						if _, exists := (*removedFiles)[filestate.CommitHash]; !exists {
+							(*removedFiles)[filestate.CommitHash] = []string{}
+						}
+						(*removedFiles)[filestate.CommitHash] = append((*removedFiles)[filestate.CommitHash], filestate.Filename)
+						mut.Unlock()
 						continue
 					}
 
@@ -213,10 +215,5 @@ func processFile(filestate *database.FileState) error {
 
 	processor.CountStats(filestate.FileJob)
 
-	if filestate.Binary {
-		// Stop analysis, but not an error
-		return nil
-	}
-	// PERF: Could improve performance by passing around more pointers instead of values, esp. for FileState
 	return nil
 }
