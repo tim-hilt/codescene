@@ -76,14 +76,14 @@ func Analyze(db *database.DB, repo string, force bool, filestateProcessedCallbac
 	}
 	defer repository.Close()
 
-	commits, numCommits, filestates, numFilestates, err := repository.Log()
+	errs := make(chan error)
+
+	commits, numCommits, filestates, numFilestates, err := repository.Log(errs)
 	if err != nil {
 		return err
 	}
 
 	log.Info().Str("repo", repo).Int("commits", numCommits).Msg("Injecting new commits")
-
-	errs := make(chan error)
 
 	go db.PersistCommits(commits, errs)
 

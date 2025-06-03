@@ -9,50 +9,47 @@ import (
 	"github.com/tim-hilt/codescene/internal/database"
 )
 
-func parseCommit(commitString string) (database.Commit, []database.FileState, error) {
-	commitString = strings.TrimSpace(commitString)
-	lines := strings.Split(commitString, "\n")
+func parseCommit(commitString string) (database.Commit, error) {
+	commitData := strings.SplitN(commitString, ";", 4)
 
-	commitData := strings.Split(strings.Trim(lines[0], "'"), ";")
-
-	commit := database.Commit{
+	return database.Commit{
 		Hash:    commitData[0],
+		Date:    commitData[1],
 		Author:  commitData[2],
 		Message: commitData[3],
-		Date:    commitData[1],
-	}
+	}, nil
+}
 
+func parseFilestates(filechanges []string) ([]database.FileState, error) {
 	var filestates []database.FileState
-
-	for _, line := range lines[1:] {
-		fileChange := strings.Split(line, "\t")
-		if fileChange[0] == "-" && fileChange[1] == "-" || line == "" {
+	for _, filechange := range filechanges {
+		filechangeParts := strings.Split(filechange, "\t")
+		if filechangeParts[0] == "-" && filechangeParts[1] == "-" {
 			// Don't record binary files, skip empty lines
 			continue
 		}
-		linesAdded, err := strconv.ParseInt(fileChange[0], 10, 32)
+		linesAdded, err := strconv.ParseInt(filechangeParts[0], 10, 32)
 		if err != nil {
-			return database.Commit{}, nil, err
+			return nil, err
 		}
-		linesDeleted, err := strconv.ParseInt(fileChange[1], 10, 32)
+		linesDeleted, err := strconv.ParseInt(filechangeParts[1], 10, 32)
 		if err != nil {
-			return database.Commit{}, nil, err
+			return nil, err
 		}
-		renameFrom, path := getRenamedPaths(fileChange[2])
+		renameFrom, path := getRenamedPaths(filechangeParts[2])
 		filestates = append(filestates, database.FileState{
-			CommitHash:   commitData[0],
-			RenameFrom:   renameFrom,
 			LinesAdded:   linesAdded,
 			LinesDeleted: linesDeleted,
+			RenameFrom:   renameFrom,
 			FileJob: &processor.FileJob{
 				Filename: path,
 			},
 		})
 	}
-
-	return commit, filestates, nil
+	return filestates, nil
 }
 
+// TODO: Could I spare calculations for renamed files? Or would there be a data race?
 func getRenamedPaths(path string) (string, string) {
 	// Case 1: {... => ...} within a path segment
 	reBrace := regexp.MustCompile(`\{([^{}]*) => ([^{}]*)\}`)

@@ -73,9 +73,8 @@ func Init() (*DB, error) {
 
 	// TODO: Do I need a primary key for the filestates?
 	createTablesStmt := `
-	            CREATE SEQUENCE id_sequence START 1;
 				CREATE TABLE IF NOT EXISTS commits (
-					id INTEGER PRIMARY KEY DEFAULT nextval('id_sequence'),
+					id INTEGER PRIMARY KEY,
 					hash TEXT UNIQUE,
 					contributor TEXT NOT NULL,
 					author_date TIMESTAMP_S NOT NULL,
@@ -277,16 +276,20 @@ func (db DB) GetProjectMetadata(project string) (ProjectMetadata, error) {
 }
 
 func (db *DB) PersistCommits(commits chan Commit, errs chan error) {
+	var id int32 = 0 // TODO: Infer id from db table
+
 	for commit := range commits {
 		date, err := time.Parse(time.RFC3339, commit.Date)
 		if err != nil {
 			errs <- err
 			return
 		}
-		if err = db.commitsAppender.AppendRow(commit.Hash, commit.Author, date, commit.Project, commit.Message); err != nil {
+		if err = db.commitsAppender.AppendRow(id, commit.Hash, commit.Author, date, commit.Project, commit.Message); err != nil {
 			errs <- err
 			return
 		}
+
+		id++
 	}
 
 	if err := db.commitsAppender.Flush(); err != nil {
@@ -307,12 +310,12 @@ func (db *DB) PersistFileStates(filestates chan FileState, numFilestates int, fi
 			filestate.Filename,
 			filestate.RenameFrom,
 			filestate.Language,
-			int32(filestate.LinesAdded),
-			int32(filestate.LinesDeleted),
 			int32(filestate.Code),
 			int32(filestate.Comment),
 			int32(filestate.Blank),
 			int32(filestate.Complexity),
+			int32(filestate.LinesAdded),
+			int32(filestate.LinesDeleted),
 		)
 		if err != nil {
 			errs <- err
@@ -331,14 +334,14 @@ func (db *DB) Flush() error {
 	return nil
 }
 func (db *DB) FillFilestates(repo string, removedFiles map[string][]string) error {
-	hashes, err := db.getCommitHashes(repo)
+	hashes, err := db.GetCommitHashes(repo)
 	if err != nil {
 		return err
 	}
 
 	var filestatesLastCommit []FileState
 	for _, hash := range hashes {
-		filestatesCurrentCommit, err := db.getFilestatesWithHash(hash)
+		filestatesCurrentCommit, err := db.GetFilestatesWithHash(hash)
 		if err != nil {
 			return err
 		}
@@ -367,12 +370,12 @@ func (db *DB) FillFilestates(repo string, removedFiles map[string][]string) erro
 				filestateLastCommit.Filename,
 				filestateLastCommit.RenameFrom,
 				filestateLastCommit.Language,
-				int32(filestateLastCommit.LinesAdded),
-				int32(filestateLastCommit.LinesDeleted),
 				int32(filestateLastCommit.Code),
 				int32(filestateLastCommit.Comment),
 				int32(filestateLastCommit.Blank),
 				int32(filestateLastCommit.Complexity),
+				int32(filestateLastCommit.LinesAdded),
+				int32(filestateLastCommit.LinesDeleted),
 			); err != nil {
 				return err
 			}
@@ -386,7 +389,7 @@ func (db *DB) FillFilestates(repo string, removedFiles map[string][]string) erro
 	return db.Flush()
 }
 
-func (db DB) getCommitHashes(repo string) ([]string, error) {
+func (db DB) GetCommitHashes(repo string) ([]string, error) {
 	query := "SELECT hash from commits WHERE project = ? ORDER BY id"
 	rows, err := db.Query(query, repo)
 	if err != nil {
@@ -410,7 +413,7 @@ func (db DB) getCommitHashes(repo string) ([]string, error) {
 	return hashes, nil
 }
 
-func (db DB) getFilestatesWithHash(hash string) ([]FileState, error) {
+func (db DB) GetFilestatesWithHash(hash string) ([]FileState, error) {
 	query := "SELECT * from filestates WHERE commit_hash = ?"
 	rows, err := db.Query(query, hash)
 	if err != nil {

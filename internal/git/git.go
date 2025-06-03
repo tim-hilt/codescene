@@ -59,10 +59,8 @@ func Clone(repo string, shallowSince time.Time) (Repository, error) {
 	return Repository{destination, repo}, nil
 }
 
-const commitSeparator = "COMMIT_START"
-
-func (r Repository) Log() (chan database.Commit, int, chan database.FileState, int, error) {
-	cmd := exec.Command("git", "log", "--reverse", "--numstat", "--pretty=format:"+commitSeparator+"%H;%aI;%an;%s")
+func (r Repository) Log(errs chan error) (chan database.Commit, int, chan database.FileState, int, error) {
+	cmd := exec.Command("git", "log", "--reverse", "--pretty=format:%H;%aI;%an;%s")
 	cmd.Dir = r.Path
 
 	stdout, err := cmd.Output()
@@ -75,38 +73,62 @@ func (r Repository) Log() (chan database.Commit, int, chan database.FileState, i
 	}
 
 	commitsString := string(stdout)
-	commitStrings := strings.Split(commitsString, commitSeparator)[1:]
-	commits := make([]database.Commit, len(commitStrings))
-	var filestates []database.FileState
-
-	for i, commitString := range commitStrings {
-		commit, fs, err := parseCommit(commitString)
-		if err != nil {
-			return nil, -1, nil, -1, err
-		}
-		commit.Project = r.repo
-		commits[i] = commit
-		filestates = append(filestates, fs...)
-	}
+	commitStrings := strings.Split(strings.TrimSpace(commitsString), "\n")
 
 	cs := make(chan database.Commit)
 	fs := make(chan database.FileState, Concurrency)
 
 	go func() {
 		defer close(cs)
-		for _, commit := range commits {
-			cs <- commit
-		}
-	}()
-
-	go func() {
 		defer close(fs)
-		for _, filestate := range filestates {
-			fs <- filestate
+
+		for i, commitString := range commitStrings {
+			commit, err := parseCommit(commitString)
+			if err != nil {
+				errs <- err
+				return
+			}
+			commit.Project = r.repo
+			cs <- commit
+
+			var previousHash string
+			if i == 0 {
+				// empty tree hash
+				previousHash = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+			} else {
+				previousHash = strings.SplitN(commitStrings[i-1], ";", 2)[0] // TODO: This could be a bit more elegant
+			}
+
+			cmd := exec.Command("git", "diff", "--no-renames", "--numstat", previousHash, commit.Hash)
+			cmd.Dir = r.Path
+
+			stdout, err := cmd.Output()
+
+			if err != nil {
+				errs <- err
+				return
+			}
+
+			if len(stdout) == 0 {
+				continue
+			}
+
+			filechanges := strings.Split(strings.TrimSpace(string(stdout)), "\n")
+			filestates, err := parseFilestates(filechanges)
+
+			if err != nil {
+				errs <- err
+				return
+			}
+
+			for _, filestate := range filestates {
+				filestate.CommitHash = commit.Hash
+				fs <- filestate // TODO: Monitor fullness of channel!
+			}
 		}
 	}()
 
-	return cs, len(commitStrings), fs, len(filestates), nil
+	return cs, len(commitStrings), fs, len(fs), nil // TODO: Get rid of this hack
 }
 
 func (r Repository) Show(hash, file string) ([]byte, error) {
@@ -131,6 +153,20 @@ func (r Repository) Show(hash, file string) ([]byte, error) {
 	}
 
 	return stdout.Bytes(), nil
+}
+
+func (r Repository) Files(hash string) ([]string, error) {
+	cmd := exec.Command("git", "ls-tree", "-r", "--name-only", hash)
+	cmd.Dir = r.Path
+
+	stdout, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	files := strings.Split(strings.TrimSpace(string(stdout)), "\n")
+
+	return files, nil
 }
 
 func (r Repository) Close() error {
