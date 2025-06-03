@@ -1,4 +1,5 @@
 import Card from "@/components/Card";
+import PackedCircles from "@/components/PackedCircles";
 import PlotFigure from "@/components/PlotFigure";
 import * as Plot from "@observablehq/plot";
 import { createFileRoute } from "@tanstack/react-router";
@@ -90,6 +91,7 @@ function RouteComponent() {
 				/>
 				<Card title="Contributors" content={data.contributorData.length} />
 			</div>
+			<PackedCircles />
 			<div className="grid grid-cols-2 gap-8">
 				<PlotFigure
 					options={{
